@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import webbrowser
 
 from . import paths
@@ -26,6 +27,32 @@ def _load_image():
     return Image.new("RGBA", (64, 64), (13, 19, 28, 255))
 
 
+# 连续点击托盘时，这段时间内只打开一次（双击、手抖连点都拦得住）
+OPEN_COOLDOWN = 10.0
+
+
+def make_opener(url: str, cooldown: float = OPEN_COOLDOWN):
+    """返回一个"带冷却的打开器"：冷却期内的调用直接忽略。
+
+    托盘图标的默认动作是左键单击，用户连点几下会弹出一堆浏览器窗口，
+    所以这里做去重。返回 True 表示真的打开了。
+    """
+    last = [0.0]
+
+    def open_once(*_args, **_kwargs) -> bool:
+        now = time.time()
+        if now - last[0] < cooldown:
+            return False
+        last[0] = now
+        try:
+            webbrowser.open(url, new=0, autoraise=True)
+        except Exception:  # noqa: BLE001 - 没有浏览器也不能让托盘崩掉
+            return False
+        return True
+
+    return open_once
+
+
 def start(url: str, on_quit=None) -> bool:
     """启动托盘图标，成功返回 True。"""
     if not paths.FROZEN:
@@ -37,8 +64,7 @@ def start(url: str, on_quit=None) -> bool:
     except Exception:  # noqa: BLE001 - 没装依赖就安静跳过
         return False
 
-    def _open(_icon=None, _item=None):
-        webbrowser.open(url)
+    _open = make_opener(url)
 
     def _quit(icon, _item=None):
         icon.visible = False
