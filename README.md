@@ -1,5 +1,7 @@
 # EVE 行星工业监视器
 
+**项目地址：<https://github.com/JuniorWisher/eve-online-pi-monitor>**
+
 本地网页程序，登录 EVE Online 账号后查看名下所有角色的行星工业（Planetary Industry）状况：
 哪些提取器快到期、哪个殖民地的仓库快满了、工厂在造什么、各层级物资库存有多少。
 

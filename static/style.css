@@ -811,3 +811,6 @@ td.num.isk { color: #8fe0b8; }
 .about div { display: flex; gap: 10px; }
 .about span { color: var(--muted); min-width: 62px; }
 .about b { font-weight: 600; color: var(--text); }
+
+.about a { color: var(--accent); text-decoration: none; }
+.about a:hover { text-decoration: underline; }
