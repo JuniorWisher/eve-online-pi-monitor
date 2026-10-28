@@ -1,0 +1,9 @@
+{
+  "client_id": "",
+  "client_secret": "",
+  "redirect_uri": "http://localhost:5000/callback",
+  "host": "127.0.0.1",
+  "port": 5000,
+  "contact_email": "",
+  "cache_ttl": 300
+}

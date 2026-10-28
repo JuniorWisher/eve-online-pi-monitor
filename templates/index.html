@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>行星工业监视器 · EVE Online</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ asset_version }}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🪐</text></svg>">
+</head>
+<body>
+<div id="demoRibbon" class="ribbon" hidden>演示模式 · 当前展示的是假数据</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <div>
+      <h1>行星工业监视器</h1>
+      <p class="sub">Planetary Industry Monitor</p>
+    </div>
+  </div>
+
+  <div class="actions">
+    <span class="updated" id="updatedAt"></span>
+    <button class="btn ghost" id="refreshBtn" title="重新拉取 ESI 数据">
+      <span class="spin-icon">↻</span> 刷新
+    </button>
+    <button class="btn ghost" id="settingsBtn">设置</button>
+    <a class="btn primary" id="loginBtn" href="/login">＋ 添加角色</a>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="overview">殖民地总览</button>
+  <button class="tab" data-tab="inventory">库存报表</button>
+  <button class="tab" data-tab="chars">角色</button>
+  <button class="tab" data-tab="settings">设置</button>
+</nav>
+
+<main>
+  <!-- 总览 -->
+  <section id="tab-overview" class="panel-tab">
+    <div class="notice" id="reauthNotice" hidden></div>
+    <div class="kpis" id="kpis"></div>
+    <div class="tier-strip" id="tierStrip"></div>
+
+    <div class="toolbar">
+      <div class="filters" id="filters">
+        <button class="chip active" data-filter="all">全部</button>
+        <button class="chip" data-filter="urgent">需处理</button>
+        <button class="chip" data-filter="expired">已到期</button>
+        <button class="chip" data-filter="idle">无提取器</button>
+      </div>
+      <input class="search" id="search" placeholder="搜索星球 / 星系 / 角色…">
+      <button class="chip" id="expandAll">展开全部</button>
+    </div>
+
+    <div class="grid" id="colonyGrid"></div>
+    <div class="empty" id="overviewEmpty" hidden></div>
+  </section>
+
+  <!-- 库存 -->
+  <section id="tab-inventory" class="panel-tab" hidden>
+    <div class="toolbar">
+      <div class="filters">
+        <button class="chip active" data-inv="rows">按星球</button>
+        <button class="chip" data-inv="types">按物资汇总</button>
+      </div>
+      <input class="search" id="invSearch" placeholder="搜索物资 / 角色…">
+      <div class="spacer"></div>
+      <span class="muted" id="invTotals"></span>
+      <a class="btn ghost" href="/api/export.csv">导出 CSV</a>
+    </div>
+    <div class="table-wrap"><table class="data" id="invTable"></table></div>
+    <div class="tier-panels" id="invPanels" hidden></div>
+    <div class="empty" id="invEmpty" hidden>还没有库存数据。先添加角色并刷新一次。</div>
+  </section>
+
+  <!-- 角色 -->
+  <section id="tab-chars" class="panel-tab" hidden>
+    <div class="settings-grid">
+      <div class="card">
+        <h2>角色开关</h2>
+        <p class="muted">
+          点右侧开关决定该角色是否参与统计。关闭后它的殖民地、海关、建筑库存都会从总览和报表里移除，
+          但不影响授权状态。切换后立即重新计算，不会重新请求 ESI。
+        </p>
+        <div id="charManage" class="char-manage"></div>
+        <div class="row" style="margin-top:16px">
+          <a class="btn primary" href="/login">＋ 添加角色</a>
+          <button class="btn ghost" id="selectAllChars">全部开启</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>说明</h2>
+        <ul class="notes">
+          <li>每个角色对应一次 EVE SSO 授权，同账号的多个角色要分别添加。</li>
+          <li>「移除」会删除本地保存的授权，下次查看需要重新授权。</li>
+          <li>开关只是显示过滤，数据仍保留在本地缓存里，重新打开立刻恢复。</li>
+        </ul>
+        <h2 class="mt">数据</h2>
+        <p class="muted" id="storeInfo"></p>
+        <div class="row">
+          <button class="btn ghost" id="clearCache">清空缓存并重新拉取</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="tab-settings" class="panel-tab" hidden>
+    <div class="settings-grid">
+      <div class="card">
+        <h2>EVE 应用凭据</h2>
+        <p class="muted">
+          在 <a href="https://developers.eveonline.com/applications" target="_blank" rel="noreferrer">developers.eveonline.com</a>
+          创建应用，类型选 <b>Authentication &amp; API Access</b>，回调地址填下面的值，
+          权限必须勾选下面这几项（少一个都会导致登录或功能异常）：
+        </p>
+        <div class="scope-list" id="scopeList"></div>
+        <label class="field">
+          <span>Client ID <em id="cidHint" class="muted"></em></span>
+          <input id="setClientId" placeholder="留空表示不修改" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>Secret Key <em id="secretHint" class="muted"></em></span>
+          <input id="setSecret" type="password" placeholder="留空表示不修改" autocomplete="new-password">
+        </label>
+        <label class="field">
+          <span>回调地址（必须与 EVE 应用里填写的完全一致）</span>
+          <input id="setRedirect" readonly>
+        </label>
+        <label class="field">
+          <span>联系邮箱（CCP 要求 User-Agent 里带联系方式）</span>
+          <input id="setEmail" placeholder="you@example.com" autocomplete="off">
+        </label>
+        <div class="row">
+          <button class="btn primary" id="saveSettings">保存</button>
+          <button class="btn ghost" id="copyRedirect">复制回调地址</button>
+          <span class="status" id="settingsStatus"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>说明</h2>
+        <ul class="notes">
+          <li>登录走 EVE 官方 SSO，程序不接触你的账号密码。</li>
+          <li>refresh token 加密存在本地 <code>data/pi.db</code>，可随时在「角色」页移除。</li>
+          <li>行星数据有 5 分钟左右的 ESI 缓存，手动点「刷新」会带上条件请求，尽量少消耗额度。</li>
+        </ul>
+        <h2 class="mt">数据刷新</h2>
+        <label class="field">
+          <span>ESI 数据多久自动过期 <em class="muted">（改完立即保存）</em></span>
+          <select id="setOverviewTtl">
+            <option value="0">手动（只有点「刷新」才更新）</option>
+            <option value="300">5 分钟</option>
+            <option value="900">15 分钟</option>
+            <option value="1800">30 分钟</option>
+            <option value="3600">1 小时</option>
+          </select>
+        </label>
+        <p class="muted" style="font-size:11.5px;margin-top:-4px">
+          CCP 要求客户端遵循 ESI 返回的 <code>Expires</code>，行星数据一般是 <b>5 分钟</b>，
+          这也是官方推荐的最小间隔——设得比这更短没有意义，只会更快消耗请求额度。
+        </p>
+
+        <h2 class="mt">关于</h2>
+        <div class="about">
+          <div><span>版本</span><b id="appVersion">—</b></div>
+          <div><span>Wisher</span><b id="appWisher">—</b></div>
+          <div><span>Creator</span><b id="appCreator">—</b></div>
+        </div>
+
+        <h2 class="mt">程序</h2>
+        <p class="muted">
+          配置和数据库保存在下面这个目录，换 exe 位置不影响。要关掉程序点下面的按钮，
+          或者在任务管理器里结束「行星工业监视器」。
+        </p>
+        <p class="muted" id="dataDir"
+           style="font-family:var(--mono);font-size:11.5px;word-break:break-all;margin-top:-6px"></p>
+        <p class="muted" id="dataWarn" hidden
+           style="font-size:11.5px;color:#f5bc74;margin-top:-4px"></p>
+        <div class="row">
+          <button class="btn danger" id="quitApp">退出程序</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  window.DEMO_MODE = {{ 'true' if demo_mode else 'false' }};
+</script>
+<script src="{{ url_for('static', filename='app.js') }}?v={{ asset_version }}"></script>
+</body>
+</html>

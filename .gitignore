@@ -1,0 +1,35 @@
+# 本地配置与凭据
+config.json
+
+# 数据库、密钥、日志
+data/
+*.log
+
+# 虚拟环境
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# 截图等临时文件
+shot*.png
+v[0-9]*.png
+ov.json
+_ico.html
+ic.png
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 工具缓存
+.workbuddy-ai/
