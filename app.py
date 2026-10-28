@@ -31,7 +31,6 @@ from core.esi import ESI, ESIError
 LOGIC_VERSION = "4"
 
 SNAPSHOT_MIN_GAP = 600  # 两次快照最小间隔（秒），避免刷一次存一次
-OVERVIEW_MEMO_TTL = 30  # 同一份结果的内存复用时间（秒）
 
 
 def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
@@ -68,6 +67,8 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
         "esi": None,
         "memo": {"ts": 0.0, "key": None, "overview": None, "prev": None},
         "lock": threading.Lock(),
+        # 重建总览的锁：多个页面同时点刷新时，只让第一个真正去拉 ESI
+        "build_lock": threading.Lock(),
     }
 
     def get_esi():
@@ -274,21 +275,35 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
                     _refresh_prices(payload)
                     return jsonify(payload)
 
-        try:
-            overview = pi.build_overview(get_esi(), chars)
-        except ESIError as exc:
-            return jsonify({"error": f"ESI 请求失败：{exc.message}"}), 502
-        except sso.AuthError as exc:
-            return jsonify({"error": str(exc), "needs_login": True}), 401
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"构建数据失败：{exc}"}), 500
+        # single-flight：并发点刷新时，排在后面的请求直接复用前面刚建好的结果
+        req_start = time.time()
+        with state["build_lock"]:
+            memo = state["memo"]
+            reused = (
+                memo.get("overview") is not None
+                and memo.get("key") == sig
+                and (memo.get("ts") or 0) >= req_start
+            )
+            if reused:
+                overview = memo["overview"]
+            else:
+                try:
+                    overview = pi.build_overview(get_esi(), chars)
+                except ESIError as exc:
+                    return jsonify({"error": f"ESI 请求失败：{exc.message}"}), 502
+                except sso.AuthError as exc:
+                    return jsonify({"error": str(exc), "needs_login": True}), 401
+                except Exception as exc:  # noqa: BLE001
+                    return jsonify({"error": f"构建数据失败：{exc}"}), 500
 
-        prev = _record_snapshots(overview, demo_mode)
-        if not demo_mode:
-            store.save_overview(sig, overview)
+                prev = _record_snapshots(overview, demo_mode)
+                if not demo_mode:
+                    store.save_overview(sig, overview)
+                with state["lock"]:
+                    state["memo"].update(
+                        {"ts": time.time(), "key": sig, "overview": overview, "prev": prev}
+                    )
 
-        with state["lock"]:
-            state["memo"].update({"ts": time.time(), "key": sig, "overview": overview, "prev": prev})
         payload = dict(overview)
         payload["cached"] = False
         payload["prices_at"] = market.last_fetched()
