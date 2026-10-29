@@ -381,7 +381,9 @@ function renderTierStrip(sum) {
   $('#tierStrip').innerHTML = `
     <div class="group"><span class="caption">殖民地库存</span>${tiers.map((t) => cell(t, stock[t])).join('')}</div>
     <div class="divider"></div>
-    <div class="group"><span class="caption">提取预估</span>${tiers.map((t) => cell(t, est[t])).join('')}</div>
+    <div class="group" title="按提取器最近一次模拟的周期速率 × 全程周期数外推。速率会随矿脉衰减，所以这个数偏保守——实测游戏面板的总量比它高约 17%。">
+      <span class="caption">提取预估</span>${tiers.map((t) => cell(t, est[t])).join('')}
+    </div>
     <span class="caption" style="margin-left:auto">单位：个</span>`;
 }
 
@@ -568,8 +570,20 @@ function extractorRing(e) {
   return ring('extractor', elapsedPct, cls, title, ICON_EXTRACTOR, attrs);
 }
 
+/* 需处理按钮：有未处理的殖民地就高亮并显示数量（已手动标记的不算） */
+function updateUrgentChip(list) {
+  const chip = document.querySelector('[data-filter="urgent"]');
+  if (!chip) return;
+  const n = (list || []).filter(
+    (c) => colonyNeedsAttention(c) && !S.acked.has(`${c.character_id}:${c.planet_id}`)
+  ).length;
+  chip.textContent = n ? `需处理 ${n}` : '需处理';
+  chip.classList.toggle('alert', n > 0);
+}
+
 function renderColonies(list) {
   const grid = $('#colonyGrid');
+  updateUrgentChip(list);
   const shown = list.filter(colonyMatches);
 
   if (!shown.length) {
@@ -672,6 +686,19 @@ function characterCard(g) {
   </article>`;
 }
 
+/* 游戏内数据时间：取该殖民地最新的「工厂周期开始 / 提取程序安装」时间。
+   CCP 只在客户端打开过殖民地时才重算这些值，所以它比 HTTP 缓存时间更接近真实。 */
+function dataAgeHtml(c) {
+  if (c.data_time == null) return '';
+  const age = Date.now() / 1000 - c.data_time;
+  const cls = age > 48 * 3600 ? 'stale' : age > 6 * 3600 ? 'old' : '';
+  const title =
+    `游戏内数据时间 ${fmtTime(c.data_time_iso)}\n` +
+    '取 ESI 殖民地列表的 last_update：CCP 最后一次重算这个殖民地的时间。\n' +
+    'CCP 只在客户端打开过它时才重算，数字对不上时先进游戏点开一次，再点「刷新」。';
+  return `<span class="age ${cls}" title="${esc(title)}">数据 ${fmtAgo(age)}</span>`;
+}
+
 function colonyRow(c) {
   const storages = (c.storages || [])
     .filter((s) => s.is_storage)
@@ -705,6 +732,7 @@ function colonyRow(c) {
           ${c.planet_type ? `<span class="pill" title="${esc(c.planet_type_raw || '')}">${esc(c.planet_type)}</span>` : ''}
           ${c.security != null ? `<span class="sec ${c.sec_class}">${c.security.toFixed(2)}</span>` : ''}
           <span class="muted">${esc(bits.join(' · '))}</span>
+          ${dataAgeHtml(c)}
         </div>
       </div>
       <div class="cg-rings">${rings || '<span class="muted" style="font-size:11.5px">无仓储</span>'}</div>
@@ -714,54 +742,82 @@ function colonyRow(c) {
   </div>`;
 }
 
-function detailHtml(c) {
-  const rows = c.pins
-    .map((p) => {
-      let content = '';
-      let qty = '';
-      if (p.kind === 'extractor' && p.extractor) {
-        const e = p.extractor;
-        content = `${esc(e.product)} <span class="muted">· ${e.heads} 个头 · 每 ${Math.round(e.cycle_time / 60)} 分钟一周期</span>`;
-        qty = `${fmtNum(e.qty_per_cycle)}/周期`;
-      } else if (p.kind === 'factory' && p.factory) {
-        content = p.factory.product
-          ? `${esc(p.factory.product)} <span class="muted">· 图纸 #${esc(p.factory.schematic_id)}</span>`
-          : `<span class="muted">图纸 #${esc(p.factory.schematic_id)}（产物未在路由中体现）</span>`;
-        qty = p.factory.tier !== '?' ? `<span class="tier ${esc(p.factory.tier)}">${esc(p.factory.tier)}</span>` : '';
-      } else if (p.contents.length) {
-        // 全部列出，不截断——P4 数量小，排序后总在末尾，截断最容易把它藏掉
-        content = p.contents
-          .map(
-            (i) =>
-              `<span class="tier ${esc(i.tier)}">${esc(i.tier)}</span> ` +
-              `<span title="${esc(i.name_en || '')}">${esc(i.name)}</span> ` +
-              `<span class="muted">×${fmtNum(i.amount)}</span>`
-          )
-          .join('<br>');
-        qty = p.used_m3 != null ? `${fmtNum(p.used_m3, 1)} m³` : '';
-      } else {
-        content = '<span class="muted">—</span>';
-      }
-      return `<tr>
-        <td class="kind" title="${esc(p.type_name_en || '')}">${esc(p.kind_label)}</td>
-        <td>${content}</td>
-        <td class="num">${qty}</td>
-      </tr>`;
-    })
-    .join('');
+/* 详情页排序权重：指挥中心 → 仓储 → 提取器 → 提取程序 → P1/P2/P3/P4 工厂 → 其他 */
+const PIN_RANK = { command_center: 0, storage: 1, extractor: 2 };
+const EXTRACTOR_PROGRAM_RANK = 2.5;
+const FACTORY_RANK = { P1: 3, P2: 4, P3: 5, P4: 6 };
 
-  const ext = c.extractors
-    .map(
-      (e) => `<tr>
-        <td class="kind">提取程序</td>
-        <td>${esc(e.product)} <span class="muted">· ${e.heads} 头</span></td>
-        <td class="num">${fmtNum(e.est_done)} / ${fmtNum(e.est_total)}</td>
-      </tr>`
-    )
-    .join('');
+function pinRank(p) {
+  if (p.kind === 'factory') return FACTORY_RANK[(p.factory && p.factory.tier) || ''] ?? 7;
+  return PIN_RANK[p.kind] ?? 8;
+}
+
+function pinRow(p) {
+  let content = '';
+  let qty = '';
+  if (p.kind === 'extractor' && p.extractor) {
+    const e = p.extractor;
+    content = `${esc(e.product)} <span class="muted">· ${e.heads} 个头 · 每 ${Math.round(e.cycle_time / 60)} 分钟一周期</span>`;
+    qty = `${fmtNum(e.qty_per_cycle)}/周期`;
+  } else if (p.kind === 'factory' && p.factory) {
+    content = p.factory.product
+      ? `${esc(p.factory.product)} <span class="muted">· 图纸 #${esc(p.factory.schematic_id)}</span>`
+      : `<span class="muted">图纸 #${esc(p.factory.schematic_id)}（产物未在路由中体现）</span>`;
+    qty = p.factory.tier !== '?' ? `<span class="tier ${esc(p.factory.tier)}">${esc(p.factory.tier)}</span>` : '';
+  } else if (p.contents.length) {
+    // 全部列出，不截断——P4 数量小，排序后总在末尾，截断最容易把它藏掉
+    content = p.contents
+      .map(
+        (i) =>
+          `<span class="tier ${esc(i.tier)}">${esc(i.tier)}</span> ` +
+          `<span title="${esc(i.name_en || '')}">${esc(i.name)}</span> ` +
+          `<span class="muted">×${fmtNum(i.amount)}</span>`
+      )
+      .join('<br>');
+    qty = p.used_m3 != null ? `${fmtNum(p.used_m3, 1)} m³` : '';
+  } else if (p.kind === 'storage') {
+    // 空仓储也照常列出：容量和 0% 占用本身就是有用的信息
+    content = '<span class="muted">空仓</span>';
+    qty = p.capacity_m3 ? `0 / ${fmtNum(p.capacity_m3, 0)} m³` : '';
+  } else {
+    content = '<span class="muted">—</span>';
+  }
+  return `<tr>
+    <td class="kind" title="${esc(p.type_name_en || '')}">${esc(p.kind_label)}</td>
+    <td>${content}</td>
+    <td class="num">${qty}</td>
+  </tr>`;
+}
+
+function extractorProgramRow(e) {
+  // ESI 只给 qty_per_cycle（最近一次模拟那个周期采到多少），既没有全程平均也没有总量。
+  // 这里按该速率 × 剩余周期数算"还能采多少"，偏乐观；反过来 × 总周期数算全程会偏保守。
+  const tip =
+    `当前速率 ${fmtNum(e.rate_per_hour)}/小时（ESI 的 qty_per_cycle × 每小时周期数）\n` +
+    'ESI 不给全程平均，也不给总量：qty_per_cycle 只代表最近一次模拟的那个周期，' +
+    '会随矿脉衰减一路变小。\n' +
+    '实测某提取器：游戏面板总量比"按该速率 × 总周期数"的线性外推高约 17%。';
+  return `<tr>
+    <td class="kind">提取程序</td>
+    <td>${esc(e.product)} <span class="muted">· ${e.heads} 头</span></td>
+    <td class="num" title="${esc(tip)}">剩余 ${fmtNum(e.est_remaining)} <span class="muted">· ${fmtNum(
+    e.rate_per_hour
+  )}/时</span></td>
+  </tr>`;
+}
+
+function detailHtml(c) {
+  // 按「指挥中心 → 仓储 → 提取器 → 提取程序 → P1~P4 工厂」重排，
+  // 同权重内保持 ESI 原顺序（seq），避免每次刷新位置乱跳
+  const entries = c.pins.map((p, i) => ({ rank: pinRank(p), seq: i, html: pinRow(p) }));
+  c.extractors.forEach((e, i) =>
+    entries.push({ rank: EXTRACTOR_PROGRAM_RANK, seq: c.pins.length + i, html: extractorProgramRow(e) })
+  );
+  entries.sort((a, b) => a.rank - b.rank || a.seq - b.seq);
+  const rows = entries.map((x) => x.html).join('');
 
   return `<h4>建筑与内容（${c.pin_count} 个引脚 / ${c.link_count} 条链接 / ${c.route_count} 条路由）</h4>
-    <table class="pin-table">${rows}${ext}</table>
+    <table class="pin-table">${rows}</table>
     <p class="muted" style="font-size:11px;margin:10px 0 0;line-height:1.6">
       提取器产量按程序开始时的速率估算，实际会随矿脉衰减而下降。<br>
       数据来自 ESI，CCP 只在客户端里打开过该殖民地时才重算，对不上时先在游戏里点开一次再刷新。
@@ -1083,6 +1139,27 @@ function bind() {
 /* -------------------------------------------------------------- 倒计时 */
 
 /* 每分钟把提取器圆环按当前时间重算一遍（不请求 ESI） */
+/* 每 5 分钟看一次数据是否超过 TTL，超了就静默重新拉（服务端再按 TTL 决定要不要重建） */
+function scheduleAutoRefresh() {
+  const CHECK_MS = 5 * 60 * 1000;
+
+  const check = async () => {
+    const ttl = Number((S.config && S.config.overview_ttl) || 0);
+    if (ttl <= 0) return;          // 手动模式：永远不自动更新
+    if (!S.times.gen) return;
+    if (document.hidden) return;   // 切到后台先不拉，等回前台再说
+    if (S.busy) return;
+    if (Date.now() / 1000 - S.times.gen < ttl) return;
+    await loadOverview(false, true);
+  };
+
+  setInterval(check, CHECK_MS);
+  // 从后台切回来时立刻判断一次，不用等下一个 5 分钟
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) check();
+  });
+}
+
 function renderTimes() {
   const now = Date.now() / 1000;
   const parts = [];
@@ -1145,6 +1222,7 @@ async function boot() {
 
   await loadOverview(false);
   setInterval(tick, 60000);
+  scheduleAutoRefresh();
 }
 
 boot();

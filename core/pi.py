@@ -201,6 +201,8 @@ def build_overview(esi, characters: list[dict], now: float | None = None) -> dic
                         "character_name": ch["name"],
                         "planet_id": p.get("planet_id"),
                         "system_id": p.get("solar_system_id"),
+                        # 殖民地列表自带 last_update：CCP 最后一次重算这个殖民地的时间
+                        "last_update": p.get("last_update"),
                     }
                 )
 
@@ -366,7 +368,7 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
     factories = []
     storages = []
     tier_units: dict[str, float] = {}       # 仓储里实打实的库存
-    tier_estimate: dict[str, float] = {}    # 提取程序预计总产出（上限估算）
+    tier_estimate: dict[str, float] = {}    # 提取程序全程产出（按末次周期速率外推，偏保守）
 
     for pin in pins_raw:
         type_id = pin.get("type_id")
@@ -380,7 +382,8 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
         kind = "other"
         if pin.get("extractor_details"):
             kind = "extractor"
-        elif pin.get("factory_details"):
+        elif pin.get("factory_details") or pin.get("schematic_id"):
+            # ESI 实际返回的是引脚上的 schematic_id；factory_details 只在部分版本/演示数据里有
             kind = "factory"
         elif "command center" in lower:
             kind = "command_center"
@@ -416,7 +419,12 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
             duration = max((expiry - install), 1.0) if (install and expiry) else 0.0
             remaining = max((expiry - now), 0.0) if expiry else 0.0
             cycles_total = duration / cycle if duration else 0.0
+            cycles_left = remaining / cycle if cycle else 0.0
+            # qty_per_cycle 是「最近一次模拟的那个周期实际采到多少」，会随矿脉衰减一路变小，
+            # 不是全程平均（实测某提取器：ESI 7,341，游戏面板全程平均 8,826，差 17%）。
+            # 所以任何 × 周期数的外推都只是近似，est_remaining 偏乐观、est_total 偏保守。
             est_total = qty * cycles_total
+            est_remaining = qty * cycles_left
             progress = (1 - remaining / duration) if duration else 0.0
             product_id = ed.get("product_type_id")
             ext = {
@@ -440,6 +448,7 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
                 "head_radius": ed.get("head_radius"),
                 "est_total": est_total,
                 "est_done": est_total * max(0.0, min(1.0, progress)),
+                "est_remaining": est_remaining,
                 "rate_per_hour": qty / cycle * 3600.0 if cycle else 0.0,
                 "expired": remaining <= 0,
             }
@@ -451,8 +460,8 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
 
         # 工厂
         fd = pin.get("factory_details")
-        if fd:
-            schematic_id = fd.get("schematic_id")
+        schematic_id = (fd or {}).get("schematic_id") or pin.get("schematic_id")
+        if schematic_id:
             product_id = factory_output.get(pin.get("pin_id"))
             product_name = ""
             product_en = ""
@@ -517,7 +526,8 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
             item["fill"] = (used / capacity) if capacity else None
             # 任何引脚里的物资都算库存（指挥中心、工厂缓冲区也会存货），
             # 只有发射平台/储存设施才计入容量占比。
-            if items:
+            # 空仓储也要留着——容量和 0% 占用本身就是信息，别让它从界面上消失。
+            if items or kind == "storage":
                 storages.append(
                     {
                         "pin_id": pin.get("pin_id"),
@@ -534,6 +544,19 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
                 )
 
         pins.append(item)
+
+    # 「游戏内数据时间」：优先用殖民地列表里的 last_update（CCP 最后一次重算这个殖民地的时间）。
+    # 拿不到时退回引脚时间戳的最大值（工厂周期开始 / 提取程序安装）。
+    # 它比 HTTP 缓存时间更能说明"这堆数字是游戏里哪一刻的"——纯工厂殖民地尤其明显。
+    data_time = parse_time(ref.get("last_update"))
+    if data_time is None:
+        stamps = []
+        for pin in pins_raw:
+            for key in ("last_cycle_start", "install_time"):
+                t = parse_time(pin.get(key))
+                if t:
+                    stamps.append(t)
+        data_time = max(stamps) if stamps else None
 
     next_expiry = min((e["expiry"] for e in extractors if e["expiry"]), default=None)
     # 「下一次到期」只算还在运行的程序，已到期的单独统计
@@ -568,6 +591,9 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
         "pin_count": len(pins),
         "link_count": len(links),
         "route_count": len(routes),
+        "data_time": data_time,
+        "data_time_iso": _iso(data_time),
+        "data_age": (now - data_time) if data_time else None,
         "next_expiry": next_expiry,
         "next_expiry_iso": _iso(next_expiry),
         "next_future_expiry": next_future,
