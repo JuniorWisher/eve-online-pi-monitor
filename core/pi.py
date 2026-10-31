@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from . import i18n, market
+from .recipes import RECIPES
 
 # PI 物资按分组判定层级。优先用 group_id（稳定），名称只作兜底。
 # 分组 id 来自 ESI /universe/categories/42 与 /43。
@@ -35,6 +36,8 @@ P1_PER_BASIC = 20       # 每周期产出
 P2_PER_ADV = 5
 # 满负荷运转时每个工厂的日产量
 DAILY_BY_TIER = {"P1": 960, "P2": 120, "P3": 72, "P4": 24}
+# 每周期产出，用来把"产物数量"换算成需要的周期数
+YIELD_PER_CYCLE = {"P1": P1_PER_BASIC, "P2": P2_PER_ADV, "P3": 3, "P4": 1}
 # 相邻两层之间的换算：上一层数量 × 系数 = 下一层数量
 STEP_TO_NEXT = {"P0": 20 / 3000, "P1": 5 / 80, "P2": 3 / 20, "P3": 1 / 12}
 TIER_ORDER = ["P0", "P1", "P2", "P3", "P4"]
@@ -329,10 +332,20 @@ def _forecast(esi, extractors: list, factories: list, storages: list, decay: flo
         peak_fill = end_fill
         end_used = used - input_volume + output_volume
 
+        # 加工完这些原料需要多久：周期数 ÷ 工厂数 × 每周期时长
+        cycle_sec = BASIC_CYCLE if top == "P1" else ADV_CYCLE
+        n_top = max(1, len(top_facs))
+        # 需要 3 种 P3 的 P4 配方，工厂实际只能半速运转
+        speed = 0.5 if (top == "P4" and recipe and recipe[0] == 3) else 1.0
+        proc_sec = (out_units / YIELD_PER_CYCLE.get(top, 1)) / n_top * cycle_sec / speed
+        cycles_day = n_top * (86400.0 / cycle_sec) * speed
+
         return {
             "kind": f"{top}合成",
             "pure": True,
-            "duration": 0.0,
+            "duration": proc_sec,
+            "speed": speed,
+            "cycles_day": cycles_day,
             "p0_total": 0.0,
             "p0_by_product": {},
             "p1": 0.0,
@@ -347,13 +360,23 @@ def _forecast(esi, extractors: list, factories: list, storages: list, decay: flo
             "consumed": consumed,
             "input_volume": input_volume,
             "p0_left": 0.0,
+            "produced": {top: out_units},
+            # 只算真正进出仓库的物资：产出是终产物，消耗是从仓储取走的那部分
+            "mat": {
+                "produced": {out_id: out_units} if out_id else {},
+                "consumed": {
+                    it["type_id"]: it["amount"]
+                    * min(1.0, (consumed.get(it["tier"], 0.0) / direct.get(it["tier"], 1.0)) or 0.0)
+                    for it in inputs
+                    if consumed.get(it["tier"], 0.0) > 0
+                },
+            },
             "storages": per_bin,
             "accumulate_m3": max(0.0, end_used - used),
             "used_m3": used,
             "capacity_m3": cap,
             "end_fill": end_fill,
             "peak_fill": peak_fill,
-            "peak_used_m3": max((b["peak_used_m3"] for b in per_bin), default=used),
             "peak_hour": 0.0,
             "overflow": bool(peak_fill is not None and peak_fill > 0.95),
         }
@@ -516,12 +539,18 @@ def _forecast(esi, extractors: list, factories: list, storages: list, decay: flo
         "output_name": out_name,
         "accumulate_m3": accumulate,
         "p0_left": p0_left,
+        "consumed": {
+            "P0": p1 * P0_PER_P1,
+            "P1": p2 * P1_PER_P2,
+        },
+        "produced": {"P0": p0_total, "P1": p1, "P2": p2},
+        # 采集殖民地：P0 本地采本地用，中间层也在本地产出，所以只记终产物的入库量
+        "mat": {"produced": {out_id: output} if out_id else {}, "consumed": {}},
         "storages": per_bin,
         "used_m3": used,
         "capacity_m3": cap,
         "end_fill": end_fill,
         "peak_fill": peak_fill,
-        "peak_used_m3": peak_vol,
         "peak_hour": peak_hour,
         "overflow": bool((peak_fill if peak_fill is not None else end_fill) is not None
                          and (peak_fill if peak_fill is not None else end_fill) > 0.95),
@@ -815,6 +844,20 @@ def apply_correction(esi, colonies, summary, prices, correction: float, decay: f
     summary["forecast_p4"] = fc_p4
     summary["forecast_isk_day"] = fc_isk
     summary["forecast_net_isk"] = fc_net
+
+    # 原料核算要用的物资名称表（type_id → 中文名），覆盖配方表全部条目
+    mat_names: dict[str, str] = {
+        str(tid): i18n.commodity(tid, rec["name"]) for tid, rec in RECIPES.items()
+    }
+    for c in colonies:
+        m = (c.get("forecast") or {}).get("mat") or {}
+        for tid in set(list(m.get("produced") or {}) + list(m.get("consumed") or {})):
+            key = str(tid)
+            if key not in mat_names:
+                en = esi.type_info(int(tid)).get("name") or key
+                mat_names[key] = i18n.commodity(int(tid), en)
+    summary["mat_names"] = mat_names
+    summary["recipes"] = {str(k): v for k, v in RECIPES.items()}
 
 def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now, correction=0.0) -> dict:
     planet_id = ref["planet_id"]

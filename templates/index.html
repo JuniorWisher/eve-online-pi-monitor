@@ -33,7 +33,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="overview">殖民地总览</button>
   <button class="tab" data-tab="inventory">库存报表</button>
-  <button class="tab" data-tab="advice">优化推荐</button>
+  <button class="tab" data-tab="materials">原料核算</button>
   <button class="tab" data-tab="chars">角色</button>
   <button class="tab" data-tab="settings">设置</button>
 </nav>
@@ -51,6 +51,7 @@
         <button class="chip" data-filter="urgent">爆仓预警</button>
         <button class="chip" data-filter="expired">已到期</button>
         <button class="chip" data-filter="idle">合成工厂</button>
+        <button class="chip" data-filter="advice">优化推荐</button>
       </div>
       <input class="search" id="search" placeholder="搜索星球 / 星系 / 角色…">
       <button class="chip" id="expandAll">展开全部</button>
@@ -78,13 +79,21 @@
   </section>
 
   <!-- 角色 -->
-  <section id="tab-advice" class="panel-tab" hidden>
+  <section id="tab-materials" class="panel-tab" hidden>
     <div class="card">
-      <h3>优化推荐</h3>
-      <p class="muted" style="margin:0 0 12px;font-size:12px">
-        这些星球可能需要优化，请自行判断。
-      </p>
-      <div id="adviceList"></div>
+      <h2>合成工厂</h2>
+      <div id="matColonies"></div>
+    </div>
+    <div class="card mt">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <h2 style="margin:0">模拟（在现有基础上增加合成）</h2>
+        <button class="chip" id="simOnly" title="忽略殖民地实际工厂，只统计模拟出来的消耗">只看模拟</button>
+      </div>
+      <div id="matSim"></div>
+    </div>
+    <div class="card mt">
+      <h2>原料核算</h2>
+      <div id="matBalance"></div>
     </div>
   </section>
 
@@ -158,6 +167,8 @@
           <li>登录走 EVE 官方 SSO，程序不接触你的账号密码。</li>
           <li>refresh token 加密存在本地 <code>data/pi.db</code>，可随时在「角色」页移除。</li>
           <li>行星数据有 5 分钟左右的 ESI 缓存，手动点「刷新」会带上条件请求，尽量少消耗额度。</li>
+          <li>物品价格来自 <b>Fuzzwork</b> 聚合接口的 <b>Jita 4-4 最高买价</b>（立刻挂单能成交的价），
+            用于估算库存价值和合成收益。价格约每小时更新一次。</li>
         </ul>
         <h2 class="mt">数据刷新</h2>
         <label class="field">

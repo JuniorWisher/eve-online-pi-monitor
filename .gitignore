@@ -23,6 +23,11 @@ ic.png
 # 导出产物（含角色名、星球等个人游戏数据）
 exports/
 
+# 第三方参考页面（从 ceve-industry.cn 抓取，体积大且有版权问题，勿入库）
+ceve.html
+ceve.js
+m.html
+
 # 打包产物
 build/
 dist/

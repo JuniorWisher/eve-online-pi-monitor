@@ -882,3 +882,37 @@ td.num.isk { color: #8fe0b8; }
 .over { color: #ff8a8a; font-weight: 600; }
 /* 匿名占位符 */
 .sec.anon { color: var(--text-dim); letter-spacing: 1px; }
+
+/* 详情里的优化建议 */
+.advice-inline {
+  margin: 8px 0 10px;
+  padding: 8px 10px;
+  border-left: 2px solid #f5bc74;
+  background: rgba(245, 188, 116, .08);
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.advice-inline b { color: #f5bc74; }
+.advice-inline ul { margin: 4px 0 0; padding-left: 18px; color: var(--text-dim); }
+
+/* 原料核算表 */
+.mat-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.mat-table th {
+  text-align: left; font-weight: 500; color: var(--text-dim);
+  padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.mat-table td { padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.mat-table td.num, .mat-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.mat-table tbody tr:last-child td { border-bottom: none; }
+.pos { color: #45d6c4; }
+.neg { color: #ff8a8a; }
+
+/* 卡片行星名后的产物 */
+.pname .prod {
+  margin-left: 6px;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--accent);
+  opacity: .85;
+}

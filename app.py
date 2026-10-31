@@ -28,7 +28,7 @@ from core import about, demo, i18n, market, paths, pi, sso, store, tray
 from core.esi import ESI, ESIError
 
 # 解析逻辑版本：改了 pi.py 的取数/分类规则时手动 +1，让总览缓存失效
-LOGIC_VERSION = "15"
+LOGIC_VERSION = "22"
 
 SNAPSHOT_MIN_GAP = 600  # 两次快照最小间隔（秒），避免刷一次存一次
 
