@@ -20,6 +20,9 @@ ov.json
 _ico.html
 ic.png
 
+# 导出产物（含角色名、星球等个人游戏数据）
+exports/
+
 # 打包产物
 build/
 dist/

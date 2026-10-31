@@ -23,6 +23,37 @@ from . import i18n, market
 
 # PI 物资按分组判定层级。优先用 group_id（稳定），名称只作兜底。
 # 分组 id 来自 ESI /universe/categories/42 与 /43。
+# 行星工业产量换算（游戏内固定配方，改版才会变）
+P0_VOL = 0.005          # P0 单体体积
+P1_VOL = 0.19           # P1 单体体积
+P2_VOL = 0.75           # P2 单体体积
+P0_PER_P1 = 150         # 3000 P0 → 20 P1
+P1_PER_P2 = 16          # 80 P1 → 5 P2
+BASIC_CYCLE = 1800      # 基础工业设施 30 分钟一周期
+ADV_CYCLE = 3600        # 高级工业设施 60 分钟一周期
+P1_PER_BASIC = 20       # 每周期产出
+P2_PER_ADV = 5
+# 满负荷运转时每个工厂的日产量
+DAILY_BY_TIER = {"P1": 960, "P2": 120, "P3": 72, "P4": 24}
+# 相邻两层之间的换算：上一层数量 × 系数 = 下一层数量
+STEP_TO_NEXT = {"P0": 20 / 3000, "P1": 5 / 80, "P2": 3 / 20, "P3": 1 / 12}
+TIER_ORDER = ["P0", "P1", "P2", "P3", "P4"]
+TIER_VOL = {"P0": P0_VOL, "P1": P1_VOL, "P2": P2_VOL, "P3": 3.0, "P4": 50.0}
+# P4 配方表：type_id -> (需要的 P3 种类数, 每种 P3 需要的 P2 种类数)
+# 游戏里 P4 就这 8 种，按加工类型固定：
+#   3 种 P3 → 18 个 P3 出 1 个 P4
+#   2 种 P3 + 1 种 P1 → 12 个 P3 加 40 个 P1 出 1 个 P4
+P4_RECIPE = {
+    2867: (3, 2),  # 广播节点
+    2868: (3, 3),  # 反破损快速反应无人机
+    2869: (2, 2),  # 纳米-工厂
+    2870: (2, 2),  # 有机砂浆喷注器
+    2871: (3, 2),  # 递推计算模块
+    2872: (3, 2),  # 自协调能源核心
+    2875: (2, 2),  # 无菌管道
+    2876: (3, 3),  # 湿件主机
+}
+
 TIER_BY_GROUP_ID = {
     1032: "P0",  # Planet Solid - Raw Resource
     1033: "P0",  # Planet Liquid-Gas - Raw Resource
@@ -128,6 +159,375 @@ def _tier_of(esi, type_id: int) -> str:
     return "?"
 
 
+def _bin_entry(b, end_used: float, peak_used: float, is_target: bool) -> dict:
+    """拼一个仓储的预估条目（两个分支共用）。"""
+    cap = float(b.get("capacity_m3") or 0)
+    used = float(b.get("used_m3") or 0)
+
+    def pct(v):
+        return (v / cap) if cap > 0 else None
+
+    return {
+        "pin_id": b.get("pin_id"),
+        "name": b.get("type_name"),
+        "used_m3": used,
+        "capacity_m3": cap,
+        "fill": pct(used),
+        "end_used_m3": end_used,
+        "end_fill": pct(end_used),
+        "peak_used_m3": peak_used,
+        "peak_fill": pct(peak_used),
+        "is_target": is_target,
+    }
+
+
+def _max_fill(per_bin: list, key: str) -> float | None:
+    vals = [b[key] for b in per_bin if b[key] is not None]
+    return max(vals) if vals else None
+
+
+def _forecast(esi, extractors: list, factories: list, storages: list, decay: float = 0.4) -> dict | None:
+    """按提取器全程外推，估算 P0/P1/P2 产量、大周期结束时的仓储占用。
+
+    只对两类殖民地出预估：
+      P1 星球 —— 有提取器，工厂全是基础（P0→P1）
+      P2 星球 —— 有提取器，有基础 + 高级工厂，且高级工厂产物都是 P2（不能有 P3/P4）
+    其余（纯加工、带 P3/P4、没有提取器）返回 None。
+    """
+    bins = [s for s in storages if s.get("is_storage")]
+    cap = sum(float(s.get("capacity_m3") or 0) for s in bins)
+    used = sum(float(s.get("used_m3") or 0) for s in bins)
+
+    # 纯合成殖民地：没有提取器，只有工厂。
+    # 按仓储里现有的原料、结合配方算最终产物。P0 无法跨星球运输，直接忽略。
+    # 收益 = 产物价值 − 实际消耗掉的原料价值。
+    has_p4 = any((f.get("tier") or "?") == "P4" for f in factories)
+    if not extractors or has_p4:
+        tiers = [(f.get("tier") or "?") for f in factories]
+        known = [t for t in tiers if t in DAILY_BY_TIER]
+        if not known:
+            return None
+        top = max(known, key=lambda t: int(t[1]))
+        top_facs = [f for f in factories if (f.get("tier") or "?") == top]
+        out_id = next((f.get("product_id") for f in top_facs if f.get("product_id")), None)
+        recipe = P4_RECIPE.get(out_id) if top == "P4" else None
+
+        # 仓储里各层的直接库存（忽略 P0）
+        direct: dict[str, float] = {}
+        inputs: list[dict] = []
+        for st in bins:
+            for it in st.get("items") or []:
+                t = it.get("tier")
+                if t not in TIER_ORDER or t == "P0":
+                    continue
+                amt = float(it.get("amount") or 0)
+                if amt <= 0:
+                    continue
+                direct[t] = direct.get(t, 0.0) + amt
+                inputs.append({"type_id": it.get("type_id"), "amount": amt, "tier": t})
+
+        # P2 → P3 的系数：2 种 P2 各 10 个出 3 个 P3（3/20），3 种就是 3/30
+        p3_n = recipe[1] if recipe else 2
+        if not recipe:
+            p3_facs = [f for f in factories if (f.get("tier") or "?") == "P3"]
+            if p3_facs:
+                # 用"原料种类数"（2 种或 3 种 P2），不是层级数
+                p3_n = max(f.get("in_count") or 0 for f in p3_facs) or 2
+        step = dict(STEP_TO_NEXT)
+        step["P2"] = 3.0 / (10.0 * p3_n)
+
+        consumed: dict[str, float] = {}
+        if top == "P4":
+            # 1 个 P3 需要多少 P2，1 个 P2 需要多少 P1
+            k23 = 10.0 * p3_n / 3.0
+            k12 = 16.0
+            d1 = direct.get("P1", 0.0)
+            d2 = direct.get("P2", 0.0)
+            d3 = direct.get("P3", 0.0)
+            if recipe and recipe[0] == 2:
+                # 2 种 P3 + 1 种 P1：12 个 P3 加 40 个 P1 出 1 个
+                # P1 既是直接原料，又要往上去做 P2→P3，联立解：
+                #   12x = D3 + D2/k23 + (D1 - 40x)/(k12*k23)
+                denom = 12.0 + 40.0 / (k12 * k23)
+                out_units = (d3 + d2 / k23 + d1 / (k12 * k23)) / denom
+                need_p3 = 12.0 * out_units
+                direct_p1 = 40.0 * out_units
+            else:
+                # 3 种 P3：6+6+6 = 18 个 P3 出 1 个
+                out_units = (d3 + d2 / k23 + d1 / (k12 * k23)) / 18.0
+                need_p3 = 18.0 * out_units
+                direct_p1 = 0.0
+
+            # 按「直接用 P3 → 拿 P2 现做 → 拿 P1 现做」的顺序算实际消耗
+            use3 = min(need_p3, d3)
+            rest = need_p3 - use3
+            use2 = min(rest * k23, d2)
+            rest -= use2 / k23
+            use1 = min(rest * k12 * k23, max(0.0, d1 - direct_p1))
+            consumed = {"P3": use3, "P2": use2, "P1": direct_p1 + use1}
+        else:
+            # 其它层级沿用逐层折算
+            out_units = 0.0
+            for t2, amt in direct.items():
+                i0, j0 = TIER_ORDER.index(t2), TIER_ORDER.index(top)
+                if i0 >= j0:
+                    continue
+                f = 1.0
+                for k in range(i0, j0):
+                    f *= step[TIER_ORDER[k]]
+                out_units += amt * f
+                consumed[t2] = consumed.get(t2, 0.0) + amt
+
+        input_volume = sum(amt * TIER_VOL.get(t, 0.0) for t, amt in consumed.items())
+        output_volume = out_units * TIER_VOL.get(top, 0.0)
+
+        # 产物堆到路由指向的那个仓储；没有路由就选容量最大的
+        bin_ids = {b.get("pin_id") for b in bins}
+        target = None
+        for f in top_facs:
+            if f.get("out_pin") in bin_ids:
+                target = f.get("out_pin")
+                break
+        if target is None and bins:
+            target = max(bins, key=lambda b: float(b.get("capacity_m3") or 0)).get("pin_id")
+
+        per_bin = []
+        for b in bins:
+            cap_i = float(b.get("capacity_m3") or 0)
+            used_i = float(b.get("used_m3") or 0)
+            # 每个仓储扣掉的是"它自己装着的那些物资被消耗的部分"
+            used_here = 0.0
+            for it in b.get("items") or []:
+                t = it.get("tier")
+                tot = float(direct.get(t) or 0)
+                if not tot:
+                    continue
+                ratio = min(1.0, float(consumed.get(t, 0)) / tot)
+                used_here += float(it.get("amount") or 0) * float(it.get("volume") or 0) * ratio
+            delta = -used_here
+            if b.get("pin_id") == target:
+                delta += output_volume
+            end_i = max(0.0, used_i + delta)
+            per_bin.append(
+                {
+                    "pin_id": b.get("pin_id"),
+                    "name": b.get("type_name"),
+                    "used_m3": used_i,
+                    "capacity_m3": cap_i,
+                    "fill": (used_i / cap_i) if cap_i > 0 else None,
+                    "end_used_m3": end_i,
+                    "end_fill": (end_i / cap_i) if cap_i > 0 else None,
+                    "peak_used_m3": end_i,
+                    "peak_fill": (end_i / cap_i) if cap_i > 0 else None,
+                    "is_target": b.get("pin_id") == target,
+                }
+            )
+
+        # 爆仓看的是"最满的那个仓储"，不是把所有仓储加起来的平均值
+        fills = [b["end_fill"] for b in per_bin if b["end_fill"] is not None]
+        end_fill = max(fills) if fills else None
+        peak_fill = end_fill
+        end_used = used - input_volume + output_volume
+
+        return {
+            "kind": f"{top}合成",
+            "pure": True,
+            "duration": 0.0,
+            "p0_total": 0.0,
+            "p0_by_product": {},
+            "p1": 0.0,
+            "p2": 0.0,
+            "output": out_units,
+            "output_tier": top,
+            "output_id": out_id,
+            "output_name": next((f.get("product") for f in top_facs if f.get("product")), ""),
+            "recipe": list(recipe) if recipe else None,
+            "inputs": inputs,
+            "direct": direct,
+            "consumed": consumed,
+            "input_volume": input_volume,
+            "p0_left": 0.0,
+            "storages": per_bin,
+            "accumulate_m3": max(0.0, end_used - used),
+            "used_m3": used,
+            "capacity_m3": cap,
+            "end_fill": end_fill,
+            "peak_fill": peak_fill,
+            "peak_used_m3": max((b["peak_used_m3"] for b in per_bin), default=used),
+            "peak_hour": 0.0,
+            "overflow": bool(peak_fill is not None and peak_fill > 0.95),
+        }
+
+    duration = max((e.get("duration") or 0.0) for e in extractors)
+    if duration <= 0:
+        return None
+
+    basic = [f for f in factories if f.get("facility") == "basic"]
+    advanced = [f for f in factories if f.get("facility") == "advanced"]
+    hightech = [f for f in factories if f.get("facility") == "hightech"]
+
+    adv_tiers = {(f.get("tier") or "?") for f in advanced}
+    if not hightech and advanced and adv_tiers <= {"P2", "?"}:
+        kind = "P2"
+    elif not advanced and not hightech:
+        # 只有提取器、或提取器 + 基础工厂，都按 P1 星球算（纯采集时 P1 产量为 0）
+        kind = "P1"
+    else:
+        return None
+
+    # 预估 P0 产量：多个同类提取器合并，按产物分组
+    p0_by_product: dict[int, float] = {}
+    p0_total = 0.0
+    for e in extractors:
+        amt = float(e.get("est_total") or 0.0)
+        p0_total += amt
+        pid = e.get("product_id")
+        if pid:
+            p0_by_product[pid] = p0_by_product.get(pid, 0.0) + amt
+
+    # P0 → P1：受基础工厂产能和 P0 总量双重限制
+    blocks = duration / BASIC_CYCLE
+    p1_cap = len(basic) * P1_PER_BASIC * blocks
+    p1 = min(p1_cap, p0_total / P0_PER_P1) if basic else 0.0
+    p0_left = max(0.0, p0_total - p1 * P0_PER_P1)
+
+    if kind == "P2":
+        adv_cycles = duration / ADV_CYCLE
+        p2_cap = len(advanced) * P2_PER_ADV * adv_cycles
+        p2 = min(p2_cap, p1 / P1_PER_P2)
+        p1_left = max(0.0, p1 - p2 * P1_PER_P2)
+        accumulate = p2 * P2_VOL + p1_left * P1_VOL + p0_left * P0_VOL
+        out_id = next((f.get("product_id") for f in advanced if f.get("product_id")), None)
+        out_name = next((f.get("product") for f in advanced if f.get("product")), "")
+        output, tier = p2, "P2"
+    else:
+        p2 = 0.0
+        accumulate = p1 * P1_VOL + p0_left * P0_VOL
+        out_id = next((f.get("product_id") for f in basic if f.get("product_id")), None)
+        out_name = next((f.get("product") for f in basic if f.get("product")), "")
+        output, tier = p1, "P1"
+
+    # ---- 峰值模拟 ----
+    # 提取器产量随进度线性衰减：初期 S、末期 L = decay·S，平均 = q_now × (1 + 修正)
+    #   S = 2·q_now·(1+修正)/(1+decay)
+    # 工厂按固定速率消耗，所以占用在中途达到最高点，结束时反而回落。
+    def rate_at(e, t: float) -> float:
+        """第 t 秒时该提取器的产出速率（个/秒）。"""
+        d_e = float(e.get("duration") or 0)
+        c_e = float(e.get("cycle_time") or 0) or 1.0
+        if d_e <= 0:
+            return 0.0
+        cycles = d_e / c_e
+        avg = (float(e.get("est_total") or 0) / cycles) if cycles > 0 else 0.0
+        if avg <= 0:
+            return 0.0
+        start = 2.0 * avg / (1.0 + decay)
+        end_yield = decay * start
+        prog = min(1.0, max(0.0, t / d_e))
+        return (start + (end_yield - start) * prog) / c_e
+
+    consume_p0 = 3000.0 * len(basic)              # 每 30 分钟消耗的 P0
+    consume_p1 = (80.0 / 2.0) * len(advanced)     # 高级工厂 1 小时 80 P1，每 30 分钟 40
+
+    # 各层产物分别落在哪个仓储：P0 跟采集器走，P1/P2 跟工厂走
+    bin_ids = {b.get("pin_id") for b in bins}
+    biggest = max(bins, key=lambda b: float(b.get("capacity_m3") or 0)).get("pin_id") if bins else None
+
+    def _pick(cands, fallback):
+        for c in cands:
+            if c in bin_ids:
+                return c
+        return fallback
+
+    p0_bin = _pick([e.get("out_pin") for e in extractors], biggest)
+    p1_bin = _pick([f.get("out_pin") for f in basic], p0_bin or biggest)
+    p2_bin = _pick([f.get("out_pin") for f in advanced], p1_bin or biggest)
+
+    # 每个仓储里"不属于 P0/P1/P2 的那部分体积"，模拟时保持不变
+    other: dict = {}
+    cur = {"P0": 0.0, "P1": 0.0, "P2": 0.0}
+    for b in bins:
+        o = float(b.get("used_m3") or 0)
+        for it in b.get("items") or []:
+            t = it.get("tier")
+            if t in cur:
+                amt = float(it.get("amount") or 0)
+                cur[t] += amt
+                o -= amt * TIER_VOL[t]
+        other[b.get("pin_id")] = max(0.0, o)
+
+    def bin_vol(pin_id, q0, q1, q2):
+        v = other.get(pin_id, 0.0)
+        if pin_id == p0_bin:
+            v += q0 * P0_VOL
+        if pin_id == p1_bin:
+            v += q1 * P1_VOL
+        if pin_id == p2_bin:
+            v += q2 * P2_VOL
+        return v
+
+    p0, p1_, p2_ = cur["P0"], cur["P1"], cur["P2"]
+    peak_by_bin = {b.get("pin_id"): float(b.get("used_m3") or 0) for b in bins}
+    peak_vol, peak_hour = used, 0.0
+    n_blocks = max(1, int(duration / BASIC_CYCLE))
+    for k in range(n_blocks + 1):
+        for pid in peak_by_bin:
+            v = bin_vol(pid, p0, p1_, p2_)
+            if v > peak_by_bin[pid]:
+                peak_by_bin[pid] = v
+        top = max(bin_vol(pid, p0, p1_, p2_) for pid in peak_by_bin) if peak_by_bin else used
+        if top > peak_vol:
+            peak_vol, peak_hour = top, k * BASIC_CYCLE / 3600.0
+        if k == n_blocks:
+            break
+        t = k * BASIC_CYCLE
+        produced = sum(rate_at(e, t) * BASIC_CYCLE for e in extractors)
+        use0 = min(p0 + produced, consume_p0)
+        p0 += produced - use0
+        made1 = use0 / P0_PER_P1
+        use1 = min(p1_ + made1, consume_p1) if consume_p1 > 0 else 0.0
+        p1_ += made1 - use1
+        p2_ += use1 / P1_PER_P2
+
+    target = p1_bin or p0_bin or biggest
+
+    per_bin = [
+        _bin_entry(
+            b,
+            bin_vol(b.get("pin_id"), p0, p1_, p2_),
+            peak_by_bin.get(b.get("pin_id"), float(b.get("used_m3") or 0)),
+            b.get("pin_id") == target,
+        )
+        for b in bins
+    ]
+    end_fill = _max_fill(per_bin, "end_fill")
+    peak_fill = _max_fill(per_bin, "peak_fill")
+
+    return {
+        "kind": kind,
+        "duration": duration,
+        "p0_total": p0_total,
+        "p0_by_product": p0_by_product,
+        "p1": p1,
+        "p2": p2,
+        "output": output,
+        "output_tier": tier,
+        "output_id": out_id,
+        "output_name": out_name,
+        "accumulate_m3": accumulate,
+        "p0_left": p0_left,
+        "storages": per_bin,
+        "used_m3": used,
+        "capacity_m3": cap,
+        "end_fill": end_fill,
+        "peak_fill": peak_fill,
+        "peak_used_m3": peak_vol,
+        "peak_hour": peak_hour,
+        "overflow": bool((peak_fill if peak_fill is not None else end_fill) is not None
+                         and (peak_fill if peak_fill is not None else end_fill) > 0.95),
+    }
+
+
 def _capacity_for(type_name: str) -> float | None:
     lower = (type_name or "").lower()
     for keywords, cap in CAPACITY_RULES:
@@ -176,7 +576,7 @@ def _sec_class(sec: float | None) -> str:
 # 主流程
 # --------------------------------------------------------------------------
 
-def build_overview(esi, characters: list[dict], now: float | None = None) -> dict:
+def build_overview(esi, characters: list[dict], now: float | None = None, correction: float = 0.0, decay: float = 0.4) -> dict:
     now = now or time.time()
 
     char_errors: dict[int, str] = {}
@@ -292,7 +692,7 @@ def build_overview(esi, characters: list[dict], now: float | None = None) -> dic
     # 6. 组装
     colonies = []
     for ref, detail in details:
-        colonies.append(_build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now))
+        colonies.append(_build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now, correction))
 
     # 先按行星名（星系 + 罗马数字）排，没有提取器的殖民地单独放到最后
     colonies.sort(
@@ -322,6 +722,9 @@ def build_overview(esi, characters: list[dict], now: float | None = None) -> dic
     summary["stock_value"] = stock_value(colonies, assets, prices)
     summary["prices_available"] = bool(prices)
 
+    apply_correction(esi, colonies, summary, prices, correction, decay)
+
+
     return {
         "generated_at": now,
         "generated_at_iso": _iso(now),
@@ -341,7 +744,79 @@ def build_overview(esi, characters: list[dict], now: float | None = None) -> dic
     }
 
 
-def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> dict:
+def apply_correction(esi, colonies, summary, prices, correction: float, decay: float = 0.4) -> None:
+    """按修正系数重算预估产量、收益和汇总。
+
+    纯计算：只用已经拿到的殖民地和价格，不访问网络。
+    改设置里的修正值时直接对内存里的总览重跑这个函数即可。
+    """
+    factor = 1.0 + correction
+    for c in colonies:
+        tier_estimate: dict[str, float] = {}
+        for e in c.get("extractors") or []:
+            e["est_total"] = float(e.get("est_total_raw") or 0.0) * factor
+            e["est_remaining"] = float(e.get("est_remaining_raw") or 0.0) * factor
+            e["est_done"] = e["est_total"] * float(e.get("progress") or 0.0)
+            t = e.get("tier")
+            if t and t != "?":
+                tier_estimate[t] = tier_estimate.get(t, 0.0) + e["est_total"]
+        c["tier_estimate"] = tier_estimate
+        c["forecast"] = _forecast(
+            esi,
+            c.get("extractors") or [],
+            c.get("factories") or [],
+            c.get("storages") or [],
+            decay,
+        )
+
+    fc_p1 = fc_p2 = fc_p3 = fc_p4 = fc_isk = fc_net = 0.0
+    for c in colonies:
+        f = c.get("forecast")
+        if not f:
+            continue
+        out_price = (prices.get(int(f["output_id"])) or {}).get("buy") if f.get("output_id") else None
+        if f.get("pure"):
+            # 纯合成：收益 = 产物价值 − 原料价值（一次把库存原料加工完）
+            in_value = 0.0
+            ok = True
+            direct = f.get("direct") or {}
+            consumed = f.get("consumed") or {}
+            for it in f.get("inputs") or []:
+                ip = (prices.get(int(it["type_id"])) or {}).get("buy") if it.get("type_id") else None
+                if ip is None:
+                    ok = False
+                    break
+                # 只算真正被消耗掉的那部分原料
+                t = it.get("tier")
+                tot = float(direct.get(t) or 0)
+                ratio = (float(consumed.get(t, 0)) / tot) if tot > 0 else 0.0
+                in_value += float(it["amount"]) * ratio * ip
+            f["net_isk"] = (f["output"] * out_price - in_value) if (out_price and ok) else None
+            f["isk_day"] = None
+        else:
+            days = (f["duration"] or 0) / 86400.0
+            f["isk_day"] = (f["output"] / days * out_price) if (out_price and days > 0) else None
+        tier = f.get("output_tier")
+        if tier == "P1":
+            fc_p1 += f["output"]
+        elif tier == "P2":
+            fc_p2 += f["output"]
+        elif tier == "P3":
+            fc_p3 += f["output"]
+        elif tier == "P4":
+            fc_p4 += f["output"]
+        if f.get("isk_day"):
+            fc_isk += f["isk_day"]
+        if f.get("net_isk"):
+            fc_net += f["net_isk"]
+    summary["forecast_p1"] = fc_p1
+    summary["forecast_p2"] = fc_p2
+    summary["forecast_p3"] = fc_p3
+    summary["forecast_p4"] = fc_p4
+    summary["forecast_isk_day"] = fc_isk
+    summary["forecast_net_isk"] = fc_net
+
+def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now, correction=0.0) -> dict:
     planet_id = ref["planet_id"]
     system_id = ref["system_id"]
     pins_raw = detail.get("pins") or []
@@ -357,11 +832,19 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
 
     # 工厂产物：从出向路由推断（路由 source = 工厂，content_type_id = 产物）
     factory_output: dict[int, int] = {}
+    # 工厂原料：从入向路由推断，用来判断配方需要哪几层、各几种
+    factory_inputs: dict[int, set] = {}
+    factory_dest: dict[int, int] = {}
     for route in routes:
         src = route.get("source_pin_id")
+        dst = route.get("destination_pin_id")
         ct = route.get("content_type_id")
         if src and ct:
             factory_output.setdefault(src, ct)
+            if dst:
+                factory_dest.setdefault(src, dst)
+        if dst and ct:
+            factory_inputs.setdefault(dst, set()).add(ct)
 
     pins = []
     extractors = []
@@ -423,8 +906,12 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
             # qty_per_cycle 是「最近一次模拟的那个周期实际采到多少」，会随矿脉衰减一路变小，
             # 不是全程平均（实测某提取器：ESI 7,341，游戏面板全程平均 8,826，差 17%）。
             # 所以任何 × 周期数的外推都只是近似，est_remaining 偏乐观、est_total 偏保守。
-            est_total = qty * cycles_total
-            est_remaining = qty * cycles_left
+            # 原始外推（未修正）。修正系数由 apply_correction 在展示层叠加，
+            # 这样改修正值不用重新拉 ESI。
+            est_total_raw = qty * cycles_total
+            est_remaining_raw = qty * cycles_left
+            est_total = est_total_raw
+            est_remaining = est_remaining_raw
             progress = (1 - remaining / duration) if duration else 0.0
             product_id = ed.get("product_type_id")
             ext = {
@@ -447,6 +934,10 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
                 "heads": len(ed.get("heads") or []),
                 "head_radius": ed.get("head_radius"),
                 "est_total": est_total,
+                "est_total_raw": est_total_raw,
+                "out_pin": factory_dest.get(pin.get("pin_id")),
+                "in_count": len(factory_inputs.get(pin.get("pin_id")) or ()),
+                "est_remaining_raw": est_remaining_raw,
                 "est_done": est_total * max(0.0, min(1.0, progress)),
                 "est_remaining": est_remaining,
                 "rate_per_hour": qty / cycle * 3600.0 if cycle else 0.0,
@@ -487,6 +978,12 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
                 "product_en": product_en,
                 "tier": tier,
                 "facility": facility,
+                "out_pin": factory_dest.get(pin.get("pin_id")),
+                "in_count": len(factory_inputs.get(pin.get("pin_id")) or ()),
+                "in_tiers": sorted(
+                    {t for t in (_tier_of(esi, x) for x in factory_inputs.get(pin.get("pin_id")) or ())
+                     if t in TIER_ORDER}
+                ),
             }
             item["factory"] = fac
             factories.append(fac)
@@ -608,6 +1105,7 @@ def _build_colony(esi, ref, detail, name_map, planet_meta, system_meta, now) -> 
         "fill": (storage_m3 / capacity_m3) if capacity_m3 else None,
         "tier_units": tier_units,
         "tier_estimate": tier_estimate,
+        "forecast": _forecast(esi, extractors, factories, storages),
         "pins": pins,
         "links": links,
         "routes": [

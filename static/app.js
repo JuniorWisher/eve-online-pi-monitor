@@ -8,7 +8,10 @@ const S = {
   inventory: null,
   filter: 'all',
   search: '',
-  invMode: 'rows',
+  invMode: 'types',
+  anon: false,
+  rawOverview: null,
+  rawChars: null,
   invSearch: '',
   acked: new Set(),
   times: { gen: null, price: null },
@@ -108,7 +111,8 @@ async function api(path, opts = {}) {
 async function loadState() {
   const st = await api('/api/state');
   S.config = st.config;
-  S.chars = st.characters || [];
+  S.rawChars = st.characters || [];
+  S.chars = S.rawChars;
   S.active = new Set(S.chars.map((c) => c.id));
   renderChars();
   renderSettings(st);
@@ -139,7 +143,6 @@ function renderChars() {
       return `<div class="char-row ${on ? '' : 'is-off'}">
         <span class="dot ${on ? 'on' : ''}"></span>
         <span class="name">${esc(c.name)}</span>
-        <span class="id">#${c.id}</span>
         <span class="cstat">${esc(meta)}</span>
         <label class="switch"><input type="checkbox" data-toggle="${c.id}" ${on ? 'checked' : ''}> 统计</label>
         <button class="btn danger" data-del="${c.id}">移除</button>
@@ -296,7 +299,8 @@ async function loadOverview(force, silent) {
       renderEmpty();
       return;
     }
-    S.overview = data;
+    S.rawOverview = data;
+    applyAnon();
     S.acked.clear(); // 已处理只是本次查看期间的标记，重新取数后回到实际状态
     $('#overviewEmpty').hidden = true;
     $('#tab-overview').classList.remove('is-empty');
@@ -381,8 +385,14 @@ function renderTierStrip(sum) {
   $('#tierStrip').innerHTML = `
     <div class="group"><span class="caption">殖民地库存</span>${tiers.map((t) => cell(t, stock[t])).join('')}</div>
     <div class="divider"></div>
-    <div class="group" title="按提取器最近一次模拟的周期速率 × 全程周期数外推。速率会随矿脉衰减，所以这个数偏保守——实测游戏面板的总量比它高约 17%。">
-      <span class="caption">提取预估</span>${tiers.map((t) => cell(t, est[t])).join('')}
+    <div class="group" title="按采集器全程外推 × 修正系数，汇总所有殖民地的预估产出。">
+      <span class="caption">预估产量</span>
+      ${cell('P1', sum.forecast_p1)}
+      ${cell('P2', sum.forecast_p2)}
+      ${cell('P3', sum.forecast_p3)}
+      ${cell('P4', sum.forecast_p4)}
+      <span class="item"><span class="n">${sum.forecast_isk_day ? fmtIsk(sum.forecast_isk_day) : '—'}</span><span class="u">ISK/天</span></span>
+      ${sum.forecast_net_isk ? `<span class="item"><span class="n">${fmtIsk(sum.forecast_net_isk)}</span><span class="u">加工净收益</span></span>` : ''}
     </div>
     <span class="caption" style="margin-left:auto">单位：个</span>`;
 }
@@ -398,13 +408,13 @@ function renderKpis(sum, assets) {
     {
       label: '24 小时内到期',
       value: fmtNum(sum.expiring_24h),
-      hint: sum.expiring_2h ? `其中 ${sum.expiring_2h} 个 2 小时内` : '提取器即将停摆',
+      hint: sum.expiring_2h ? `其中 ${sum.expiring_2h} 个 2 小时内` : '采集器即将停摆',
       cls: sum.expiring_24h ? 'warn' : 'ok',
     },
     {
       label: '已到期',
       value: fmtNum(sum.expired),
-      hint: sum.expired ? '提取器已停止采集' : '全部运转中',
+      hint: sum.expired ? '采集器已停止采集' : '全部运转中',
       cls: sum.expired ? 'danger' : 'ok',
     },
     {
@@ -416,7 +426,7 @@ function renderKpis(sum, assets) {
     {
       label: '工厂',
       value: fmtNum(sum.factories),
-      hint: `提取器 ${sum.extractors} 台`,
+      hint: `采集器 ${sum.extractors} 台`,
       cls: '',
     },
     {
@@ -468,47 +478,107 @@ function isLaunchpad(s) {
   return /launchpad|spaceport/i.test(s.type_name_en || '');
 }
 
+/* 爆仓判定：已经爆仓（任一仓储 ≥95%），或按预估到本周期结束会超过 95%。
+   纯加工 / 带 P3P4 工厂 / 没有采集器的殖民地没有 forecast，不参与判断。 */
+function colonyOverflow(c) {
+  const f = c.forecast;
+  const storages = (c.storages || []).filter((s) => s.is_storage);
+  // 纯合成殖民地是按库存算好的，理论上不会爆，不参与"已经爆仓"判定，只看预估
+  const pure = !!(f && f.pure);
+  if (!pure && storages.some((s) => (s.fill || 0) >= 0.95)) return 'full';
+  if (f && f.overflow) return 'forecast';
+  return null;
+}
+
+/* 采集器已经到期 */
+function colonyExpired(c) {
+  return (c.extractors || []).some((e) => e.expired);
+}
+
 function colonyNeedsAttention(c) {
-  const exts = c.extractors || [];
-  if (!exts.length) return false; // 纯合成加工殖民地：不参与判断
+  return !!colonyOverflow(c);
+}
 
-  const storages = (c.storages || [])
-    .filter((s) => s.is_storage)
-    // 同一个殖民地既有发射平台又有储藏设施时，发射平台排前面
-    .sort((a, b) => Number(isLaunchpad(b)) - Number(isLaunchpad(a)));
-  const launchpads = storages.filter(isLaunchpad);
-  const facs = c.factories || [];
-  const p1Count = facs.filter((f) => f.facility === 'basic').length;
-  const hasP2 = facs.some((f) => f.facility === 'advanced');
-
-  // 有提取器 + 有 P2 工厂（不管还有没有 P1/P3/P4）：发射平台 ≥80% 就算需处理
-  if (hasP2) {
-    return launchpads.some((s) => (s.fill || 0) >= 0.8);
+/* 罗马数字转阿拉伯数字，用于星球名排序 */
+const ROMAN_VAL = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+function romanToInt(str) {
+  const t = String(str || '').toUpperCase();
+  let n = 0;
+  for (let i = 0; i < t.length; i += 1) {
+    const v = ROMAN_VAL[t[i]] || 0;
+    const next = ROMAN_VAL[t[i + 1]] || 0;
+    n += v < next ? -v : v;
   }
+  return n;
+}
+function planetSortKey(name) {
+  const m = String(name || '').match(/\s([IVXLCDM]+)$/);
+  return m ? [name.slice(0, m.index), romanToInt(m[1])] : [String(name || ''), 0];
+}
 
-  // 有提取器 + 只有 P1 工厂：预测提取器结束前会不会把发射平台撑爆
-  if (p1Count > 0) {
-    const remainSec = Math.max(...exts.map((e) => (e.expired ? 0 : e.remaining || 0)));
-    const blocks = Math.ceil(remainSec / 60 / 30); // 每 30 分钟一批
-    const perFactory = blocks * P1_PER_CYCLE * P1_UNIT_M3; // 每个 P1 工厂的产出体积
-    return launchpads.some((s) => {
-      const cap = s.capacity_m3 || 0;
-      if (!cap) return false;
-      return p1Count * perFactory + (s.used_m3 || 0) >= cap * 0.95;
-    });
-  }
+/* 匿名模式：把角色名 / 星球名 / 安全等级换成占位符 */
+function anonymize(ov) {
+  const charMap = new Map();
+  (ov.characters || []).forEach((ch, i) => charMap.set(ch.id, `角色 ${i + 1}`));
+  const planetMap = new Map();
+  [...(ov.colonies || [])]
+    .sort((a, b) => {
+      const byChar = String(a.character_name).localeCompare(String(b.character_name), 'zh-CN');
+      if (byChar) return byChar;
+      const [na, ra] = planetSortKey(a.planet_name);
+      const [nb, rb] = planetSortKey(b.planet_name);
+      return na === nb ? ra - rb : na.localeCompare(nb, 'zh-CN');
+    })
+    .forEach((c, i) => planetMap.set(`${c.character_id}:${c.planet_id}`, `星球 ${i + 1}`));
 
-  // 只有提取器、没有工厂：沿用任一仓储 ≥80%
-  return storages.some((s) => (s.fill || 0) >= 0.8);
+  const maskChars = (list) =>
+    (list || []).map((ch) => ({ ...ch, name: charMap.get(ch.id) || '角色' }));
+
+  return {
+    ...ov,
+    characters: maskChars(ov.characters),
+    assets: ov.assets ? { ...ov.assets, characters: maskChars(ov.assets.characters) } : ov.assets,
+    colonies: (ov.colonies || []).map((c) => ({
+      ...c,
+      character_name: charMap.get(c.character_id) || '角色',
+      planet_name: planetMap.get(`${c.character_id}:${c.planet_id}`) || '星球',
+      system_name: '星系',
+      planet_type: '行星',
+      planet_type_raw: '',
+      security: null,
+      sec_class: '',
+      sec_anon: true,
+    })),
+  };
+}
+
+function applyAnon() {
+  if (!S.rawOverview) return;
+  S.overview = S.anon ? anonymize(S.rawOverview) : S.rawOverview;
+  S.chars = S.anon
+    ? (S.rawChars || []).map((c, i) => ({ ...c, name: `角色 ${i + 1}` }))
+    : S.rawChars || [];
+}
+
+function rerenderAll() {
+  applyFilter();
+  renderChars();
+  if (S.times) renderTimes();
+  if (!$('#tab-advice').hidden) renderAdvice();
+  if (!$('#tab-inventory').hidden) renderInventory();
+}
+
+/* 超过预警线的百分比标红 */
+function warnPct(v) {
+  if (v == null) return '—';
+  const txt = fmtPct(v);
+  return v > 0.95 ? `<span class="over">${txt}</span>` : txt;
 }
 
 function colonyMatches(c) {
-  if (S.filter === 'urgent') {
-    const urgent = ['critical', 'warning', 'expired'].includes(c.urgency);
-    if (!urgent && !colonyNeedsAttention(c)) return false;
-  }
-  if (S.filter === 'expired' && c.urgency !== 'expired') return false;
-  if (S.filter === 'idle' && c.urgency !== 'idle') return false;
+  if (S.filter === 'urgent' && !colonyOverflow(c)) return false;
+  if (S.filter === 'expired' && !colonyExpired(c)) return false;
+  if (S.filter === 'idle' && !(c.forecast && c.forecast.pure)) return false;
   if (S.search) {
     const q = S.search.toLowerCase();
     const hay = `${c.planet_name} ${c.system_name} ${c.character_name} ${c.planet_type}`.toLowerCase();
@@ -547,11 +617,11 @@ function ring(kind, pct, stateCls, title, icon, attrs = '') {
 
 function storageRing(s, hot) {
   const pct = s.fill == null ? 0 : s.fill;
-  // 有提取器的殖民地，仓储超过 80% 直接判红（需处理）；其它情况沿用 80% 黄 / 95% 红
+  // 有采集器的殖民地，仓储超过 80% 直接判红（需处理）；其它情况沿用 80% 黄 / 95% 红
   const cls = hot && pct >= 0.8 ? 'full' : pct >= 0.95 ? 'full' : pct >= 0.8 ? 'warn' : '';
   const title =
     `${s.type_name}：${fmtNum(s.used_m3, 0)} / ${fmtNum(s.capacity_m3, 0)} m³（${fmtPct(s.fill)}）` +
-    (hot && pct >= 0.8 ? '　⚠ 仓储已超 80%，提取器会被顶停' : '');
+    (hot && pct >= 0.8 ? '　⚠ 仓储已超 80%，采集器会被顶停' : '');
   // 发射平台用火箭，储藏设施用立方体，和游戏内图标一致
   const icon = /storage facility/i.test(s.type_name_en || '') ? ICON_CUBE : ICON_STORAGE;
   return ring('storage', pct, cls, title, icon);
@@ -570,20 +640,27 @@ function extractorRing(e) {
   return ring('extractor', elapsedPct, cls, title, ICON_EXTRACTOR, attrs);
 }
 
-/* 需处理按钮：有未处理的殖民地就高亮并显示数量（已手动标记的不算） */
-function updateUrgentChip(list) {
-  const chip = document.querySelector('[data-filter="urgent"]');
-  if (!chip) return;
-  const n = (list || []).filter(
-    (c) => colonyNeedsAttention(c) && !S.acked.has(`${c.character_id}:${c.planet_id}`)
+/* 爆仓预警 / 已到期 两个按钮：显示数量，有货才高亮 */
+function updateChips(list) {
+  const all = list || [];
+  const overflow = all.filter(
+    (c) => colonyOverflow(c) && !S.acked.has(`${c.character_id}:${c.planet_id}`)
   ).length;
-  chip.textContent = n ? `需处理 ${n}` : '需处理';
-  chip.classList.toggle('alert', n > 0);
+  const expired = all.filter(colonyExpired).length;
+
+  const setChip = (filter, label, n, cls) => {
+    const chip = document.querySelector(`[data-filter="${filter}"]`);
+    if (!chip) return;
+    chip.textContent = n ? `${label} ${n}` : label;
+    chip.classList.toggle(cls, n > 0);
+  };
+  setChip('urgent', '爆仓预警', overflow, 'alert');
+  setChip('expired', '已到期', expired, 'warn');
 }
 
 function renderColonies(list) {
   const grid = $('#colonyGrid');
-  updateUrgentChip(list);
+  updateChips(list);
   const shown = list.filter(colonyMatches);
 
   if (!shown.length) {
@@ -705,7 +782,7 @@ function colonyRow(c) {
     // 同一个殖民地既有发射平台又有储藏设施时，发射平台排前面
     .sort((a, b) => Number(isLaunchpad(b)) - Number(isLaunchpad(a)));
   const exts = (c.extractors || []).slice().sort((a, b) => (a.expiry || 0) - (b.expiry || 0));
-  // 有提取器且仓储占用超过 80% -> 需处理（仓储满了提取器会被顶停）
+  // 有采集器且仓储占用超过 80% -> 需处理（仓储满了采集器会被顶停）
   const hot = colonyNeedsAttention(c);
   const rings = [
     ...storages.map((s) => storageRing(s, hot)),
@@ -714,12 +791,12 @@ function colonyRow(c) {
 
   const bits = [];
   if (c.factories.length) bits.push(`工厂 ${c.factories.length}`);
-  if (!exts.length) bits.push('无提取器');
+  if (!exts.length) bits.push('无采集器');
 
   const ackKey = `${c.character_id}:${c.planet_id}`;
   const acked = hot && S.acked.has(ackKey);
   const ackHtml = hot
-    ? `<span class="pill ${acked ? 'ok' : 'danger'}" title="${acked ? '已标记处理，下次刷新 ESI 后恢复实际状态' : '仓储即将被顶停，建议收菜'}">${acked ? '已处理' : '需处理'}</span>
+    ? `<span class="pill ${acked ? 'ok' : 'danger'}" title="${acked ? '已标记处理，下次刷新 ESI 后恢复实际状态' : '已经或即将爆仓，建议收菜'}">${acked ? '已处理' : '爆仓预警'}</span>
        <button class="ack-btn ${acked ? 'undo' : ''}" data-ack="${ackKey}">${acked ? '撤销' : '标记已处理'}</button>`
     : '';
 
@@ -730,7 +807,9 @@ function colonyRow(c) {
         <div class="pmeta">
           ${ackHtml}
           ${c.planet_type ? `<span class="pill" title="${esc(c.planet_type_raw || '')}">${esc(c.planet_type)}</span>` : ''}
-          ${c.security != null ? `<span class="sec ${c.sec_class}">${c.security.toFixed(2)}</span>` : ''}
+          ${c.security != null
+            ? `<span class="sec ${c.sec_class}">${c.security.toFixed(2)}</span>`
+            : (c.sec_anon ? '<span class="sec anon">███</span>' : '')}
           <span class="muted">${esc(bits.join(' · '))}</span>
           ${dataAgeHtml(c)}
         </div>
@@ -742,7 +821,7 @@ function colonyRow(c) {
   </div>`;
 }
 
-/* 详情页排序权重：指挥中心 → 仓储 → 提取器 → 提取程序 → P1/P2/P3/P4 工厂 → 其他 */
+/* 详情页排序权重：指挥中心 → 仓储 → 采集器 → 提取程序 → P1/P2/P3/P4 工厂 → 其他 */
 const PIN_RANK = { command_center: 0, storage: 1, extractor: 2 };
 const EXTRACTOR_PROGRAM_RANK = 2.5;
 const FACTORY_RANK = { P1: 3, P2: 4, P3: 5, P4: 6 };
@@ -796,7 +875,7 @@ function extractorProgramRow(e) {
     `当前速率 ${fmtNum(e.rate_per_hour)}/小时（ESI 的 qty_per_cycle × 每小时周期数）\n` +
     'ESI 不给全程平均，也不给总量：qty_per_cycle 只代表最近一次模拟的那个周期，' +
     '会随矿脉衰减一路变小。\n' +
-    '实测某提取器：游戏面板总量比"按该速率 × 总周期数"的线性外推高约 17%。';
+    '实测某采集器：游戏面板总量比"按该速率 × 总周期数"的线性外推高约 17%。';
   return `<tr>
     <td class="kind">提取程序</td>
     <td>${esc(e.product)} <span class="muted">· ${e.heads} 头</span></td>
@@ -807,7 +886,7 @@ function extractorProgramRow(e) {
 }
 
 function detailHtml(c) {
-  // 按「指挥中心 → 仓储 → 提取器 → 提取程序 → P1~P4 工厂」重排，
+  // 按「指挥中心 → 仓储 → 采集器 → 提取程序 → P1~P4 工厂」重排，
   // 同权重内保持 ESI 原顺序（seq），避免每次刷新位置乱跳
   const entries = c.pins.map((p, i) => ({ rank: pinRank(p), seq: i, html: pinRow(p) }));
   c.extractors.forEach((e, i) =>
@@ -816,10 +895,53 @@ function detailHtml(c) {
   entries.sort((a, b) => a.rank - b.rank || a.seq - b.seq);
   const rows = entries.map((x) => x.html).join('');
 
+  const f = c.forecast;
+  let fcRow = '';
+  if (f) {
+    const p0parts = Object.entries(f.p0_by_product || {}).map(([tid, amt]) => {
+      const e = (c.extractors || []).find((x) => String(x.product_id) === String(tid));
+      return `${esc(e ? e.product : 'P0')} ${fmtNum(amt)}`;
+    });
+    const outLabel = `预估${f.output_tier || 'P1'}产量`;
+    const sub = f.pure
+      ? '<span class="muted">· 纯合成，按最高级产物满负荷估算</span>'
+      : `<b>预估P0产量</b> ${p0parts.length ? p0parts.join(' + ') : '—'}` +
+        `<span class="muted">· 结束时仓储 ${f.end_fill == null ? '—' : fmtPct(f.end_fill)}</span>`;
+    const bins = (f.storages || [])
+      .map((b) => {
+        const hot = (b.end_fill || 0) > 0.95;
+        return `<div class="bin-line${hot ? ' hot' : ''}">
+          ${esc(b.name || '仓储')}
+          <span class="muted">${fmtNum(b.used_m3, 0)} →</span> <b>${fmtNum(b.end_used_m3, 0)}</b>
+          <span class="muted">/ ${fmtNum(b.capacity_m3, 0)} m³
+            （${b.fill == null ? '—' : fmtPct(b.fill)} → ${warnPct(b.end_fill)}）</span>
+          ${b.peak_fill != null && b.end_fill != null && b.peak_fill > b.end_fill + 0.001
+            ? `<span class="muted">· 峰值 </span>${warnPct(b.peak_fill)}`
+            : ''}
+          ${b.is_target ? '<span class="muted">· 产物入库</span>' : ''}
+        </div>`;
+      })
+      .join('');
+    fcRow = `<tr class="forecast-row">
+      <td class="kind">预估</td>
+      <td>
+        <b>${outLabel}</b> ${fmtNum(f.output)} ${esc(f.output_name || '')}
+        <span class="muted">· ${f.pure ? '加工完库存原料' : `周期 ${Math.round(f.duration / 3600)} 小时`}</span><br>
+        ${sub}
+        ${f.peak_fill != null && f.end_fill != null && f.peak_fill > f.end_fill + 0.001
+          ? `<br><span class="muted">整体峰值 </span>${warnPct(f.peak_fill)}<span class="muted">（第 ${Math.round(f.peak_hour || 0)} 小时）</span>`
+          : ''}
+        ${bins ? `<div class="bin-list">${bins}</div>` : ''}
+      </td>
+      <td class="num"><b>${(f.pure ? f.net_isk : f.isk_day) ? fmtIsk(f.pure ? f.net_isk : f.isk_day) : '—'}</b>
+        <span class="muted" style="display:block;font-size:10.5px">${f.pure ? '净收益 ISK' : 'ISK/天'}</span></td>
+    </tr>`;
+  }
+
   return `<h4>建筑与内容（${c.pin_count} 个引脚 / ${c.link_count} 条链接 / ${c.route_count} 条路由）</h4>
-    <table class="pin-table">${rows}</table>
+    <table class="pin-table">${fcRow}${rows}</table>
     <p class="muted" style="font-size:11px;margin:10px 0 0;line-height:1.6">
-      提取器产量按程序开始时的速率估算，实际会随矿脉衰减而下降。<br>
+      采集器产量按程序开始时的速率估算，实际会随矿脉衰减而下降。<br>
       数据来自 ESI，CCP 只在客户端里打开过该殖民地时才重算，对不上时先在游戏里点开一次再刷新。
       <a href="/api/colony/${c.character_id}/${c.planet_id}" target="_blank" rel="noreferrer">查看 ESI 原始数据</a>
     </p>`;
@@ -966,7 +1088,17 @@ function renderSettings(st) {
   $('#setEmail').value = cfg.contact_email || '';
   $('#cidHint').textContent = cfg.client_id_set ? `（已保存 ${cfg.client_id_hint}，留空表示不修改）` : '（未设置）';
   $('#secretHint').textContent = cfg.client_secret_set ? `（已保存 ${cfg.client_secret_hint}）` : '（未设置）';
-  if ($('#setOverviewTtl')) $('#setOverviewTtl').value = String(cfg.overview_ttl ?? 0);
+  if ($('#setOverviewTtl')) {
+    const sel = $('#setOverviewTtl');
+    sel.value = String(cfg.overview_ttl ?? 0);
+    if (sel.selectedIndex < 0) sel.value = '0'; // 旧配置里可能是已移除的选项
+  }
+  if ($('#setCorrection')) {
+    $('#setCorrection').value = Math.round((cfg.p0_correction ?? 0.17) * 100);
+  }
+  if ($('#setDecay')) $('#setDecay').value = String(cfg.p0_decay ?? 0.4);
+  if ($('#setAdviceExcess')) $('#setAdviceExcess').value = String(Math.round(cfg.advice_p0_excess ?? 300000));
+  if ($('#setAdviceLow')) $('#setAdviceLow').value = String(Math.round(cfg.advice_p0_low ?? 400000));
   if (st.about) {
     if ($('#appVersion')) $('#appVersion').textContent = st.about.version || '—';
     if ($('#appWisher')) $('#appWisher').textContent = st.about.wisher || '—';
@@ -996,15 +1128,87 @@ function renderSettings(st) {
 
 /* ---------------------------------------------------------------- 事件 */
 
+/* 优化推荐：挑出配置可能不合理的殖民地 */
+function renderAdvice() {
+  const box = $('#adviceList');
+  if (!box) return;
+  const cols = (S.overview && S.overview.colonies) || [];
+  const iskOf = (c) => c.forecast.net_isk || c.forecast.isk_day || 0;
+  const excess = Number((S.config && S.config.advice_p0_excess) ?? 300000);
+  const low = Number((S.config && S.config.advice_p0_low) ?? 400000);
+  const items = [];
+
+  for (const c of cols) {
+    const f = c.forecast;
+    if (!f) continue;
+    const reasons = [];
+    if (!f.pure) {
+      if ((f.p0_left || 0) > excess) {
+        reasons.push(`P0 剩余 ${fmtNum(f.p0_left)}，超过过剩判断线 ${fmtNum(excess)}`);
+      }
+      if ((f.p0_total || 0) > 0 && f.p0_total < low) {
+        reasons.push(`采集总量 ${fmtNum(f.p0_total)}，低于产量过低线 ${fmtNum(low)}`);
+      }
+    }
+    if (reasons.length) items.push({ c, reasons });
+  }
+
+  // 预估收益最低的 5 个
+  const ranked = cols
+    .filter((c) => c.forecast && iskOf(c) > 0)
+    .sort((a, b) => iskOf(a) - iskOf(b))
+    .slice(0, 5);
+  for (const c of ranked) {
+    const hit = items.find((x) => x.c === c);
+    const reason = `预估收益偏低（${fmtIsk(iskOf(c))}）`;
+    if (hit) hit.reasons.push(reason);
+    else items.push({ c, reasons: [reason] });
+  }
+
+  if (!items.length) {
+    box.innerHTML = '<p class="muted">暂时没有需要优化的殖民地。</p>';
+    return;
+  }
+
+  items.sort((a, b) => {
+    const ca = String(a.c.character_name || '');
+    const cb = String(b.c.character_name || '');
+    if (ca !== cb) return ca.localeCompare(cb, 'zh-CN');
+    const [na, ra] = planetSortKey(a.c.planet_name);
+    const [nb, rb] = planetSortKey(b.c.planet_name);
+    return na === nb ? ra - rb : na.localeCompare(nb, 'zh-CN');
+  });
+
+  box.innerHTML = items
+    .map(
+      ({ c, reasons }) => `<div class="advice-item">
+        <div class="advice-head">
+          <b>${esc(c.planet_name)}</b>
+          <span class="muted">${esc(c.character_name)} · ${esc(c.system_name || '')}</span>
+        </div>
+        <ul class="advice-reasons">${reasons.map((r) => `<li>${esc(r)}</li>`).join('')}</ul>
+      </div>`
+    )
+    .join('');
+}
+
 function switchTab(name) {
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
   $$('.panel-tab').forEach((p) => (p.hidden = p.id !== `tab-${name}`));
   if (name === 'inventory') loadInventory();
+  if (name === 'advice') renderAdvice();
   if (name === 'chars') renderChars();
 }
 
 function bind() {
   $$('.tab').forEach((t) => (t.onclick = () => switchTab(t.dataset.tab)));
+  $('#anonBtn').onclick = () => {
+    S.anon = !S.anon;
+    $('#anonBtn').classList.toggle('on', S.anon);
+    applyAnon();
+    rerenderAll();
+    toast(S.anon ? '已开启匿名模式' : '已关闭匿名模式');
+  };
   $('#settingsBtn').onclick = () => switchTab('settings');
   $('#refreshBtn').onclick = () => loadOverview(true);
 
@@ -1065,6 +1269,61 @@ function bind() {
         S.config = { ...(S.config || {}), overview_ttl: v };
         const label = e.target.selectedOptions[0]?.textContent || '';
         toast(`已保存：${label.trim()}`);
+      } catch (err) {
+        toast('保存失败：' + err.message, true);
+      }
+    };
+  }
+
+  // 优化推荐阈值：只影响判定，改完立即保存并刷新列表
+  [['#setAdviceExcess', 'advice_p0_excess'], ['#setAdviceLow', 'advice_p0_low']].forEach(
+    ([sel, key]) => {
+      const el = $(sel);
+      if (!el) return;
+      el.onchange = async (e) => {
+        const v = Math.max(0, Math.round(Number(e.target.value || 0)));
+        e.target.value = v;
+        try {
+          await api('/api/settings', { method: 'POST', body: JSON.stringify({ [key]: v }) });
+          S.config = { ...(S.config || {}), [key]: v };
+          toast(`已保存：${fmtNum(v)}`);
+          if (S.overview) renderAdvice();
+        } catch (err) {
+          toast('保存失败：' + err.message, true);
+        }
+      };
+    }
+  );
+
+  // 衰减曲线：改完立即保存并重算
+  if ($('#setDecay')) {
+    $('#setDecay').onchange = async (e) => {
+      const v = Math.max(0, Math.min(1, Math.round(Number(e.target.value || 0) * 100) / 100));
+      e.target.value = v;
+      try {
+        await api('/api/settings', { method: 'POST', body: JSON.stringify({ p0_decay: v }) });
+        S.config = { ...(S.config || {}), p0_decay: v };
+        toast(`已保存：末期产量为初期的 ${Math.round(v * 100)}%`);
+        await loadOverview(false, true);
+      } catch (err) {
+        toast('保存失败：' + err.message, true);
+      }
+    };
+  }
+
+  // 产量修正：改完立即保存并重算（服务端保存时会清掉总览缓存）
+  if ($('#setCorrection')) {
+    $('#setCorrection').onchange = async (e) => {
+      const pct = Math.max(-100, Math.min(100, Math.round(Number(e.target.value || 0))));
+      e.target.value = pct;
+      try {
+        await api('/api/settings', {
+          method: 'POST',
+          body: JSON.stringify({ p0_correction: pct / 100 }),
+        });
+        S.config = { ...(S.config || {}), p0_correction: pct / 100 };
+        toast(`已保存：${pct > 0 ? '+' : ''}${pct}%，正在按新系数重算…`);
+        await loadOverview(false, true);
       } catch (err) {
         toast('保存失败：' + err.message, true);
       }
@@ -1138,7 +1397,7 @@ function bind() {
 
 /* -------------------------------------------------------------- 倒计时 */
 
-/* 每分钟把提取器圆环按当前时间重算一遍（不请求 ESI） */
+/* 每分钟把采集器圆环按当前时间重算一遍（不请求 ESI） */
 /* 每 5 分钟看一次数据是否超过 TTL，超了就静默重新拉（服务端再按 TTL 决定要不要重建） */
 function scheduleAutoRefresh() {
   const CHECK_MS = 5 * 60 * 1000;
@@ -1183,7 +1442,7 @@ function tick() {
     const dead = remaining <= 0;
     el.classList.toggle('dead', dead);
     el.classList.toggle('warn', !dead && remaining <= 7200);
-    const name = el.dataset.product || '提取器';
+    const name = el.dataset.product || '采集器';
     el.title = `${name}：${dead ? '已到期' : '剩余 ' + fmtDur(remaining)}`;
   });
   renderTimes();
@@ -1210,7 +1469,7 @@ async function boot() {
     if (box) box.value = S.invSearch;
   }
   if (params.get('inv')) {
-    S.invMode = params.get('inv') === 'types' ? 'types' : 'rows';
+    S.invMode = params.get('inv') === 'rows' ? 'rows' : 'types';
     $$('[data-inv]').forEach((c) => c.classList.toggle('active', c.dataset.inv === S.invMode));
   }
   if (params.get('expand')) {

@@ -28,7 +28,7 @@ from core import about, demo, i18n, market, paths, pi, sso, store, tray
 from core.esi import ESI, ESIError
 
 # 解析逻辑版本：改了 pi.py 的取数/分类规则时手动 +1，让总览缓存失效
-LOGIC_VERSION = "7"
+LOGIC_VERSION = "15"
 
 SNAPSHOT_MIN_GAP = 600  # 两次快照最小间隔（秒），避免刷一次存一次
 
@@ -194,6 +194,22 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
             }
         )
 
+    def _correction() -> float:
+        """提取器产量修正系数，夹在 -1 ~ 1 之间。"""
+        try:
+            v = float(cfg.get("p0_correction"))
+        except (TypeError, ValueError):
+            return 0.17
+        return max(-1.0, min(1.0, v))
+
+    def _decay() -> float:
+        """P0 衰减曲线修正，夹在 0.05 ~ 1 之间。"""
+        try:
+            v = float(cfg.get("p0_decay"))
+        except (TypeError, ValueError):
+            return 0.4
+        return max(0.05, min(1.0, v))
+
     def _refresh_prices(payload: dict) -> None:
         """按 15 分钟缓存规则拿报价，并就地更新总览里的价格和库存估值。
 
@@ -223,12 +239,18 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
     def _signature(chars) -> str:
         return _data_version() + "|" + ",".join(str(c["id"]) for c in chars)
 
-    def current_overview():
-        """取当前总览：内存 → SQLite，全程不碰 ESI。"""
+    def current_overview(sig=None):
+        """取当前总览：内存 → SQLite，全程不碰 ESI。
+
+        sig 用来校验缓存是否由当前版本的代码生成——改了取数/计算逻辑后，
+        旧结构的数据里缺字段，直接用会算出 0 或空值。
+        """
         memo = state["memo"]
-        if memo["overview"]:
+        if memo["overview"] and (sig is None or memo.get("key") == sig):
             return memo["overview"]
         cached = None if demo_mode else store.load_overview()
+        if cached and sig is not None and cached.get("signature") != sig:
+            return None
         if cached:
             with state["lock"]:
                 memo["overview"] = cached["data"]
@@ -265,7 +287,7 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
 
         sig = _signature(chars)
         if not force:
-            overview = current_overview()
+            overview = current_overview(sig)
             if overview and state["memo"].get("key") == sig:
                 ttl = int(cfg.get("overview_ttl") or 0)
                 age = time.time() - (state["memo"].get("ts") or 0)
@@ -288,7 +310,7 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
                 overview = memo["overview"]
             else:
                 try:
-                    overview = pi.build_overview(get_esi(), chars)
+                    overview = pi.build_overview(get_esi(), chars, correction=_correction(), decay=_decay())
                 except ESIError as exc:
                     return jsonify({"error": f"ESI 请求失败：{exc.message}"}), 502
                 except sso.AuthError as exc:
@@ -401,6 +423,11 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
             cfg["client_id"] = str(body["client_id"]).strip()
         if body.get("client_secret"):
             cfg["client_secret"] = str(body["client_secret"]).strip()
+        if body.get("p0_correction") is not None:
+            try:
+                cfg["p0_correction"] = max(-1.0, min(1.0, float(body["p0_correction"])))
+            except (TypeError, ValueError):
+                pass
         if body.get("overview_ttl") is not None:
             try:
                 cfg["overview_ttl"] = max(0, int(body["overview_ttl"]))
@@ -411,6 +438,61 @@ def create_app(cfg: dict, demo_mode: bool = False) -> Flask:
         if body.get("contact_email") is not None:
             cfg["contact_email"] = str(body["contact_email"]).strip()
         cfgmod.save(cfg)
+
+        # 只改了产量修正系数：拿内存里的总览重算一遍就行，不用重新拉 ESI
+        if body.get("p0_decay") is not None:
+            try:
+                cfg["p0_decay"] = max(0.05, min(1.0, float(body["p0_decay"])))
+            except (TypeError, ValueError):
+                pass
+        for key in ("advice_p0_excess", "advice_p0_low"):
+            if body.get(key) is not None:
+                try:
+                    cfg[key] = max(0.0, float(body[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        if set(body.keys()) <= {"p0_correction", "p0_decay", "advice_p0_excess", "advice_p0_low"}:
+            # 只改了阈值时不需要重算，直接返回
+            if body.get("p0_correction") is None and body.get("p0_decay") is None:
+                return jsonify({"ok": True, "config": cfgmod.masked(cfg)})
+
+            sig_now = _signature(characters())
+            with state["lock"]:
+                ov = state["memo"].get("overview")
+            # 内存里没有总览（刚启动/刚清过缓存）时，从数据库里捞上次的结果，
+            # 照样只重算不重新拉 ESI
+            if ov is not None:
+                first = next((c for c in ov.get("colonies") or [] if c.get("extractors")), None)
+                if first and any(
+                    "est_total_raw" not in e for e in first.get("extractors") or []
+                ):
+                    ov = None  # 旧结构，交给常规重建
+            if ov is None and not demo_mode:
+                cached = store.load_overview()
+                if cached and cached.get("signature") == sig_now:
+                    ov = cached["data"]
+                    with state["lock"]:
+                        state["memo"].update(
+                            {"overview": ov, "key": sig_now, "ts": cached.get("ts") or time.time()}
+                        )
+            if ov:
+                prices = {int(k): v for k, v in (ov.get("prices") or {}).items()}
+                pi.apply_correction(
+                    get_esi(),
+                    ov.get("colonies") or [],
+                    ov.get("summary") or {},
+                    prices,
+                    _correction(),
+                    _decay(),
+                )
+                if not demo_mode:
+                    try:
+                        store.save_overview(_signature(characters()), ov)
+                    except Exception:  # noqa: BLE001 - 存不进去不影响本次展示
+                        pass
+                return jsonify({"ok": True, "config": cfgmod.masked(cfg)})
+
         state["esi"] = None  # 让客户端用新配置重建
         store.clear_overview()
         with state["lock"]:

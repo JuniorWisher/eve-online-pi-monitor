@@ -366,7 +366,11 @@ class FakeESI:
                         {
                             "pin_id": 502,
                             "type_id": 10002,
-                            "contents": [{"type_id": 2867, "amount": 24}],
+                            "contents": [
+                                {"type_id": 2867, "amount": 24},     # 已产出的广播节点 P4
+                                {"type_id": 9848, "amount": 1200},   # 待加工的 P3 原料（机器人技术）
+                                {"type_id": 9834, "amount": 1200},   # 制导系统
+                            ],
                         },
                     ],
                     "links": [],

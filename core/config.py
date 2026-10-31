@@ -28,6 +28,15 @@ DEFAULTS = {
     "cache_ttl": 300,
     # 总览缓存多久后自动过期（秒）；0 = 只在点「刷新」时更新
     "overview_ttl": 0,
+    # 提取器全程产量修正系数：-1.0 ~ 1.0（界面按 -100% ~ +100% 显示）
+    # ESI 的 qty_per_cycle 是"最近一次周期"的产量，矿脉衰减后偏低，实测差 17%
+    "p0_correction": 0.17,
+    # P0 衰减曲线修正：末期产量 / 初期产量，0~1。越接近 0 衰减越猛，峰值越靠前
+    "p0_decay": 0.4,
+    # 优化推荐阈值：大周期结束时 P0 还剩多少算"过剩"
+    "advice_p0_excess": 300000,
+    # 优化推荐阈值：P0 总产量低于多少算"过低"
+    "advice_p0_low": 400000,
 }
 
 
@@ -99,5 +108,13 @@ def masked(cfg: dict) -> dict:
         "redirect_uri": cfg.get("redirect_uri") or "",
         "contact_email": cfg.get("contact_email") or "",
         "overview_ttl": int(cfg.get("overview_ttl") or 0),
+        "p0_correction": float(cfg.get("p0_correction") if cfg.get("p0_correction") is not None else 0.17),
+        "p0_decay": float(cfg.get("p0_decay") if cfg.get("p0_decay") is not None else 0.4),
+        "advice_p0_excess": float(
+            cfg.get("advice_p0_excess") if cfg.get("advice_p0_excess") is not None else 300000
+        ),
+        "advice_p0_low": float(
+            cfg.get("advice_p0_low") if cfg.get("advice_p0_low") is not None else 400000
+        ),
         "configured": is_configured(cfg),
     }
